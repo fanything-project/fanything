@@ -275,6 +275,14 @@ local f_ssh_follows   = Field.new("ssh.first_kex_packet_follows")
 -- tcp.stream is used to correlate the banner (earlier frame) with the KEXINIT
 local f_tcp_stream    = Field.new("tcp.stream")
 
+-- QUIC fields — confirmed against Wireshark 3.6+ / 4.x.
+-- Check with:  tshark -G fields | grep '^quic\.'
+local f_quic_version   = Field.new("quic.version")
+local f_quic_token_len = Field.new("quic.token_length")  -- present only in Initial packets
+local f_quic_dcil      = Field.new("quic.dcil")
+local f_quic_scil      = Field.new("quic.scil")
+local f_quic_length    = Field.new("quic.length")
+
 -- Per-stream banner cache: stream_index → {client=..., server=...}
 -- The SSH banner arrives in its own TCP segment before KEXINIT; we cache it
 -- here so we can include id= in the KEXINIT fingerprint.
@@ -285,6 +293,10 @@ local ssh_banner_cache = {}
 -- Returns a list of {role, features} pairs for every TLS handshake in the frame.
 local function tls_fingerprints()
     local results = {}
+
+    -- QUIC frames carry TLS inside CRYPTO frames; skip here so quic_fingerprints()
+    -- handles them exclusively and avoids duplicate entries.
+    if #{ f_quic_version() } > 0 then return results end
 
     -- Collect all handshake types present in this frame
     local hs_types = collect_ints(f_tls_hs_type)
@@ -415,16 +427,106 @@ local function ssh_fingerprint()
     return { role = "peer", features = features }
 end
 
+-- ─── QUIC fingerprinting ─────────────────────────────────────────────────────
+
+-- Returns a list of {role, features} pairs for QUIC Initial packets.
+-- When Wireshark decrypts the QUIC Initial CRYPTO frame the TLS handshake
+-- fields become visible in the same frame — we reuse the existing TLS field
+-- extractors.  If the packet was not decrypted we fall back to the QUIC long
+-- header metadata (connection IDs, token length, payload length).
+--
+-- Feature string formats (matching PR #5 / fanfp.py):
+--   decrypted client: quic|client|v=<qver>|tls_v=<tlsver>|c=…|e=…|g=…|p=…|sv=…|alpn=…|sig=…
+--   decrypted server: quic|server|v=<qver>|tls_v=<tlsver>|c=…|e=…|sv=…
+--   fallback:         quic|peer|v=<qver>|type=initial|dcid_len=…|scid_len=…|token_len=…|len=…
+local function quic_fingerprints()
+    local results = {}
+
+    -- Only fire on QUIC long-header (Initial) packets
+    local quic_vers  = collect_ints(f_quic_version)
+    if #quic_vers == 0 then return results end
+    local token_lens = collect_ints(f_quic_token_len)
+    if #token_lens == 0 then return results end   -- not an Initial packet
+
+    local qver = quic_vers[1]
+
+    -- Check whether the QUIC Initial was decrypted (TLS handshake fields visible)
+    local hs_types = collect_ints(f_tls_hs_type)
+
+    if #hs_types > 0 then
+        local versions  = collect_ints(f_tls_version)
+        local ciphers   = collect_ints(f_tls_cipher)
+        local ext_types = collect_ints(f_tls_ext_type)
+        local groups    = collect_ints(f_tls_groups)
+        local points    = collect_ints(f_tls_points)
+        local sv_list   = collect_ints(f_tls_sv)
+        local alpn_list = collect_strs(f_tls_alpn)
+        local sigs      = collect_ints(f_tls_sig)
+
+        local tls_ver = versions[1] or 0
+
+        for _, hs_type in ipairs(hs_types) do
+            if hs_type == 1 then
+                -- ClientHello inside QUIC Initial
+                local features = string.format(
+                    "quic|client|v=%d|tls_v=%d|c=%s|e=%s|g=%s|p=%s|sv=%s|alpn=%s|sig=%s",
+                    qver, tls_ver,
+                    join_ints(ciphers,   true),
+                    join_ints(ext_types, true),
+                    join_ints(groups,    false),
+                    join_ints(points,    false),
+                    join_ints(sv_list,   true),
+                    table.concat(alpn_list, ","),
+                    join_ints(sigs,      false))
+                results[#results+1] = { role = "client", features = features }
+
+            elseif hs_type == 2 then
+                -- ServerHello inside QUIC Initial
+                local features = string.format(
+                    "quic|server|v=%d|tls_v=%d|c=%s|e=%s|sv=%s",
+                    qver, tls_ver,
+                    tostring(ciphers[1] or ""),
+                    join_ints(ext_types, true),
+                    tostring(sv_list[1] or ""))
+                results[#results+1] = { role = "server", features = features }
+            end
+        end
+    else
+        -- Fallback: header-only fingerprint (no decryption)
+        local dcil_fi = collect_ints(f_quic_dcil)
+        local scil_fi = collect_ints(f_quic_scil)
+        local len_fi  = collect_ints(f_quic_length)
+        local features = string.format(
+            "quic|peer|v=%d|type=initial|dcid_len=%d|scid_len=%d|token_len=%d|len=%d",
+            qver,
+            dcil_fi[1] or 0,
+            scil_fi[1] or 0,
+            token_lens[1] or 0,
+            len_fi[1] or 0)
+        results[#results+1] = { role = "peer", features = features }
+    end
+
+    return results
+end
+
 -- ─── Main dissector ───────────────────────────────────────────────────────────
 
 function p_fanfp.dissector(tvb, pinfo, root)
     local candidates = {}
 
-    -- TLS
+    -- TLS (TCP only; QUIC frames are handled below)
     local ok, tls_fps = pcall(tls_fingerprints)
     if ok then
         for _, fp in ipairs(tls_fps) do
             candidates[#candidates+1] = { protocol = "tls", role = fp.role, features = fp.features }
+        end
+    end
+
+    -- QUIC
+    local ok3, quic_fps = pcall(quic_fingerprints)
+    if ok3 then
+        for _, fp in ipairs(quic_fps) do
+            candidates[#candidates+1] = { protocol = "quic", role = fp.role, features = fp.features }
         end
     end
 
