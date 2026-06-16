@@ -1,5 +1,9 @@
 # fanything
 
+> [!WARNING]  
+> The format is still in alpha design. If you see anything concerning the extensibility of the format, let us know.
+
+
 `fanything` is an experimental, patent-unencumbered fingerprinting format and
 pcap extractor for correlating SSH and TLS handshakes.
 
