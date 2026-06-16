@@ -3,6 +3,8 @@
 > [!WARNING]  
 > The format is still in alpha design. If you see anything concerning the extensibility of the format, let us know.
 
+<img width="200" height="239" alt="f" src="https://github.com/user-attachments/assets/e2e096fd-1ae5-4090-92b8-1e0a2fe85a4a" />
+
 
 `fanything` is an experimental, patent-unencumbered fingerprinting format and
 pcap extractor for correlating SSH, TLS, and QUIC handshakes.
