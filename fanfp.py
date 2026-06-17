@@ -12,7 +12,7 @@ import json
 import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 try:
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -632,7 +632,11 @@ def quic_candidates(packets: Iterable[Packet]) -> Iterator[Tuple[str, str, str, 
             yield "quic", "peer", features, datagram
 
 
-def parse_ssh(payload: bytes) -> Optional[Tuple[str, str]]:
+def empty_ssh_features(software: str) -> str:
+    return f"ssh|peer|id={software}|kex=|hostkey=|enc_c2s=|enc_s2c=|mac_c2s=|mac_s2c=|comp_c2s=|comp_s2c=|lang_c2s=|lang_s2c=|follows="
+
+
+def parse_ssh_banner(payload: bytes) -> Optional[Tuple[str, bytes]]:
     if not payload.startswith(b"SSH-"):
         return None
     line_end = payload.find(b"\n")
@@ -640,12 +644,19 @@ def parse_ssh(payload: bytes) -> Optional[Tuple[str, str]]:
         return None
     ident = payload[:line_end].rstrip(b"\r").decode("utf-8", "replace")
     software = ident.split("-", 2)[2] if ident.count("-") >= 2 else ident
-    rest = payload[line_end + 1 :]
-    if len(rest) < 6:
-        return "peer", f"ssh|peer|id={software}|kex=|hostkey=|enc_c2s=|enc_s2c=|mac_c2s=|mac_s2c=|comp_c2s=|comp_s2c=|lang_c2s=|lang_s2c=|follows="
-    packet_len = struct.unpack_from("!I", rest, 0)[0]
-    pad_len = rest[4]
-    packet = rest[5 : 4 + packet_len - pad_len]
+    return software, payload[line_end + 1 :]
+
+
+def parse_ssh_kexinit(payload: bytes, software: str) -> Optional[Tuple[str, str]]:
+    if len(payload) < 6:
+        return None
+    packet_len = struct.unpack_from("!I", payload, 0)[0]
+    if packet_len < 2 or len(payload) < 4 + packet_len:
+        return None
+    pad_len = payload[4]
+    if pad_len >= packet_len:
+        return None
+    packet = payload[5 : 4 + packet_len - pad_len]
     if not packet or packet[0] != SSH_MSG_KEXINIT:
         return None
     off = 17
@@ -653,14 +664,26 @@ def parse_ssh(payload: bytes) -> Optional[Tuple[str, str]]:
     for _ in range(10):
         if off + 4 > len(packet):
             return None
-        ln = struct.unpack_from("!I", packet, off)[0]; off += 4
-        lists.append(packet[off:off+ln].decode("ascii", "replace")); off += ln
+        ln = struct.unpack_from("!I", packet, off)[0]
+        off += 4
+        if off + ln > len(packet):
+            return None
+        lists.append(packet[off:off+ln].decode("ascii", "replace"))
+        off += ln
     follows = str(bool(packet[off])) if off < len(packet) else ""
     names = ["kex", "hostkey", "enc_c2s", "enc_s2c", "mac_c2s", "mac_s2c", "comp_c2s", "comp_s2c", "lang_c2s", "lang_s2c"]
     return "peer", "ssh|peer|id=" + software + "|" + "|".join(f"{n}={v}" for n, v in zip(names, lists)) + f"|follows={follows}"
 
 
-def emit(protocol: str, role: str, features: str, segment: TcpSegment) -> Dict[str, object]:
+def parse_ssh(payload: bytes) -> Optional[Tuple[str, str]]:
+    banner = parse_ssh_banner(payload)
+    if not banner:
+        return None
+    software, rest = banner
+    return parse_ssh_kexinit(rest, software) or ("peer", empty_ssh_features(software))
+
+
+def emit(protocol: str, role: str, features: str, segment: Union[TcpSegment, UdpDatagram]) -> Dict[str, object]:
     fp, digest, similarity_fp, similarity_digest = fan_fingerprint(
         protocol, role, "passive", features
     )
@@ -680,19 +703,44 @@ def emit(protocol: str, role: str, features: str, segment: TcpSegment) -> Dict[s
 
 def extract(path: Path) -> Iterator[Dict[str, object]]:
     seen = set()
+    ssh_banners: Dict[Tuple[str, int, str, int], Tuple[str, TcpSegment]] = {}
+    ssh_completed = set()
     for segment in tcp_segments(read_pcap(path)):
         candidates = []
         tls = parse_tls_handshake(segment.payload)
         if tls:
             candidates.append(("tls", *tls))
-        ssh = parse_ssh(segment.payload)
-        if ssh:
-            candidates.append(("ssh", *ssh))
+
+        flow_key = (segment.src, segment.sport, segment.dst, segment.dport)
+        banner = parse_ssh_banner(segment.payload)
+        if banner:
+            software, rest = banner
+            ssh_banners[flow_key] = (software, segment)
+            ssh = parse_ssh_kexinit(rest, software)
+            if ssh:
+                ssh_completed.add(flow_key)
+                candidates.append(("ssh", *ssh))
+        elif flow_key in ssh_banners and flow_key not in ssh_completed:
+            software, _ = ssh_banners[flow_key]
+            ssh = parse_ssh_kexinit(segment.payload, software)
+            if ssh:
+                ssh_completed.add(flow_key)
+                candidates.append(("ssh", *ssh))
+
         for protocol, role, features in candidates:
             key = (protocol, role, features, tuple(segment.flow.items()))
             if key not in seen:
                 seen.add(key)
                 yield emit(protocol, role, features, segment)
+
+    for flow_key, (software, segment) in ssh_banners.items():
+        if flow_key not in ssh_completed:
+            features = empty_ssh_features(software)
+            key = ("ssh", "peer", features, tuple(segment.flow.items()))
+            if key not in seen:
+                seen.add(key)
+                yield emit("ssh", "peer", features, segment)
+
     for protocol, role, features, datagram in quic_candidates(read_pcap(path)):
         key = (protocol, role, features, tuple(datagram.flow.items()))
         if key not in seen:
