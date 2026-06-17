@@ -11,15 +11,16 @@
 The repository defines an algorithm named **FAN/1** (Flexible Anything
 Network fingerprint, version 1). FAN/1 is intentionally simple: each
 fingerprint starts with an explicit namespace, keeps a readable normalized
-feature string for analysts, and appends a stable SHA-256 digest for indexing in
-systems such as MISP.
+feature string for analysts, appends a stable SHA-256 digest for indexing in
+systems such as MISP, and can include a 128-bit SimHash companion value for
+similarity comparisons.
 
 ## FAN/1 fingerprint format
 
 A fingerprint has five semantic parts:
 
 ```text
-fan1:<protocol>:<role>:<mode>:<base64url-normalized-features>:sha256:<hex-digest>
+fan1:<protocol>:<role>:<mode>:<base64url-normalized-features>:<digest-algorithm>:<hex-digest>
 ```
 
 * `fan1` identifies the algorithm version.
@@ -31,7 +32,26 @@ fan1:<protocol>:<role>:<mode>:<base64url-normalized-features>:sha256:<hex-digest
 * `<base64url-normalized-features>` is the normalized canonical feature string,
   encoded without padding so it remains safe in JSON, CSV, MISP attributes, and
   URLs.
-* `<hex-digest>` is SHA-256 over the unencoded canonical feature string.
+* `<digest-algorithm>` identifies the digest that follows. `sha256` is the
+  required exact-match digest. `simhash128` is the optional similarity digest.
+* `<hex-digest>` is the lowercase hexadecimal digest value for the named
+  algorithm. For `sha256`, it is SHA-256 over the unencoded canonical feature
+  string.
+
+The canonical FAN/1 fingerprint string should use `sha256` when exact identity
+is required:
+
+```text
+fan1:<protocol>:<role>:<mode>:<base64url-normalized-features>:sha256:<hex-digest>
+```
+
+Collectors may also calculate a `simhash128` value over normalized feature
+tokens and expose it either as metadata or as an alternate FAN/1 string with the
+`simhash128` digest algorithm. SimHash is not a cryptographic identity digest;
+it is useful because the Hamming distance between two 128-bit SimHashes can be
+used to estimate how close two canonical feature strings are. This helps
+analysts find related client, server, or peer behaviors that differ by a few
+negotiated algorithms or extensions.
 
 The JSON output also includes the plain `features` field so analysts can inspect
 and pivot on individual parts without decoding the fingerprint.
@@ -161,7 +181,7 @@ python3 fanfp.py test/chromium-perdu.com-quick.pcap
 The command emits one JSON object per fingerprint:
 
 ```json
-{"mode":"passive","protocol":"tls","role":"client","fingerprint":"fan1:tls:client:passive:...","features":"tls|client|...","sha256":"...","flow":{"src":"192.0.2.10","sport":51514,"dst":"198.51.100.20","dport":443}}
+{"mode":"passive","protocol":"tls","role":"client","fingerprint":"fan1:tls:client:passive:...:sha256:...","fingerprint_simhash128":"fan1:tls:client:passive:...:simhash128:...","features":"tls|client|...","sha256":"...","simhash128":"...","flow":{"src":"192.0.2.10","sport":51514,"dst":"198.51.100.20","dport":443}}
 ```
 
 Active service probing with Nmap NSE:
@@ -216,6 +236,9 @@ Recommended storage approaches:
 
 * Store `fingerprint` as the primary correlation value.
 * Store `sha256` as a compact secondary pivot.
+* Store `simhash128` or `fingerprint_simhash128` as a similarity pivot when you
+  want to calculate Hamming distances between fingerprints and cluster near
+  matches.
 * Store `features` in a comment, object attribute, or custom object field for
   analyst readability.
 * Store `mode` as collection metadata so active probes and passive observations

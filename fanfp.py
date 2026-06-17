@@ -44,10 +44,49 @@ def join_ints(values: Iterable[int]) -> str:
     return "-".join(str(v) for v in values if not is_grease(v))
 
 
-def fan_fingerprint(protocol: str, role: str, mode: str, features: str) -> Tuple[str, str]:
+def simhash128(features: str) -> str:
+    """Return a 128-bit SimHash over normalized feature tokens.
+
+    FAN/1 keeps SHA-256 as the exact-match digest. SimHash is intentionally
+    token based so small feature changes tend to produce hashes with small
+    Hamming distances, which can help analysts compare related fingerprints.
+    """
+    token_text = features.replace("|", "=").replace(",", "=").replace("-", "=")
+    tokens = [token for token in token_text.split("=") if token]
+    if not tokens:
+        tokens = [features]
+    vector = [0] * 128
+    for token in tokens:
+        token_hash = int.from_bytes(
+            hashlib.sha256(token.encode("utf-8")).digest()[:16], "big"
+        )
+        for bit in range(128):
+            if token_hash & (1 << bit):
+                vector[bit] += 1
+            else:
+                vector[bit] -= 1
+    value = 0
+    for bit, weight in enumerate(vector):
+        if weight >= 0:
+            value |= 1 << bit
+    return f"{value:032x}"
+
+
+def fan_fingerprint(
+    protocol: str, role: str, mode: str, features: str
+) -> Tuple[str, str, str, str]:
     digest = hashlib.sha256(features.encode("utf-8")).hexdigest()
-    encoded = base64.urlsafe_b64encode(features.encode("utf-8")).decode("ascii").rstrip("=")
-    return f"fan1:{protocol}:{role}:{mode}:{encoded}:sha256:{digest}", digest
+    similarity_digest = simhash128(features)
+    encoded = (
+        base64.urlsafe_b64encode(features.encode("utf-8")).decode("ascii").rstrip("=")
+    )
+    prefix = f"fan1:{protocol}:{role}:{mode}:{encoded}"
+    return (
+        f"{prefix}:sha256:{digest}",
+        digest,
+        f"{prefix}:simhash128:{similarity_digest}",
+        similarity_digest,
+    )
 
 
 @dataclass(frozen=True)
@@ -622,14 +661,18 @@ def parse_ssh(payload: bytes) -> Optional[Tuple[str, str]]:
 
 
 def emit(protocol: str, role: str, features: str, segment: TcpSegment) -> Dict[str, object]:
-    fp, digest = fan_fingerprint(protocol, role, "passive", features)
+    fp, digest, similarity_fp, similarity_digest = fan_fingerprint(
+        protocol, role, "passive", features
+    )
     return {
         "mode": "passive",
         "protocol": protocol,
         "role": role,
         "fingerprint": fp,
+        "fingerprint_simhash128": similarity_fp,
         "features": features,
         "sha256": digest,
+        "simhash128": similarity_digest,
         "flow": segment.flow,
         "frame": segment.index,
     }
