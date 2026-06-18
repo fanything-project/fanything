@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract FAN/1 SSH, TLS, DTLS, X.509, QUIC, IKE, and TCP/IP fingerprints from captures."""
+"""Extract FAN/1 SSH, TLS, DTLS, X.509, QUIC, IKE, RDP, and TCP/IP fingerprints from captures."""
 
 from __future__ import annotations
 
@@ -725,6 +725,64 @@ def parse_dtls_handshake(payload: bytes, strict: bool = False) -> Optional[Tuple
     return None
 
 
+def parse_rdp_x224(payload: bytes, strict: bool = False) -> List[Tuple[str, str]]:
+    results: List[Tuple[str, str]] = []
+    offset = 0
+    while offset + 7 <= len(payload):
+        if payload[offset] != 3 or payload[offset + 1] != 0:
+            break
+        tpkt_version = payload[offset]
+        tpkt_reserved = payload[offset + 1]
+        tpkt_len = struct.unpack_from("!H", payload, offset + 2)[0]
+        if tpkt_len < 7:
+            if strict:
+                raise ValueError("invalid RDP TPKT length")
+            break
+        if offset + tpkt_len > len(payload):
+            if strict:
+                raise ValueError("truncated RDP TPKT")
+            break
+
+        tpkt = payload[offset : offset + tpkt_len]
+        offset += tpkt_len
+        x224_len = tpkt[4]
+        pdu = tpkt[5]
+        if pdu not in (0xE0, 0xD0) or len(tpkt) < 11:
+            continue
+
+        role = "client" if pdu == 0xE0 else "server"
+        dst_ref = struct.unpack_from("!H", tpkt, 6)[0]
+        src_ref = struct.unpack_from("!H", tpkt, 8)[0]
+        class_opt = tpkt[10]
+        neg_type = neg_flags = neg_len = neg_proto = neg_selected = ""
+        for neg_offset in range(11, max(11, len(tpkt) - 7)):
+            ntype = tpkt[neg_offset]
+            if ntype not in (1, 2):
+                continue
+            nflags = tpkt[neg_offset + 1]
+            nlen = struct.unpack_from("<H", tpkt, neg_offset + 2)[0]
+            if nlen < 8 or neg_offset + nlen > len(tpkt):
+                continue
+            nvalue = struct.unpack_from("<I", tpkt, neg_offset + 4)[0]
+            neg_type = str(ntype)
+            neg_flags = str(nflags)
+            neg_len = str(nlen)
+            if ntype == 1:
+                neg_proto = str(nvalue)
+            else:
+                neg_selected = str(nvalue)
+            break
+
+        features = (
+            f"rdp|{role}|tpkt_v={tpkt_version}|tpkt_rsv={tpkt_reserved}|tpkt_len={tpkt_len}"
+            f"|x224_len={x224_len}|pdu={pdu}|dst_ref={dst_ref}|src_ref={src_ref}"
+            f"|class={class_opt}|neg_type={neg_type}|neg_flags={neg_flags}"
+            f"|neg_len={neg_len}|neg_proto={neg_proto}|neg_selected={neg_selected}"
+        )
+        results.append((role, features))
+    return results
+
+
 def tls_client_features(body: bytes, protocol: str = "tls") -> str:
     off = 0
     version = struct.unpack_from("!H", body, off)[0]; off += 2 + 32
@@ -1247,6 +1305,19 @@ def extract(
         for tls_role, tls_features in tls_results:
             tls_protocol = "x509" if tls_features.startswith("x509|") else "tls"
             candidates.append((tls_protocol, tls_role, tls_features))
+
+        try:
+            rdp_results = parse_rdp_x224(segment.payload, strict=strict)
+        except (struct.error, ValueError) as exc:
+            if strict and not error_handler:
+                raise
+            if error_handler:
+                error_handler(
+                    f"skipping malformed RDP X.224 packet in frame {segment.index}", exc
+                )
+            rdp_results = []
+        for rdp_role, rdp_features in rdp_results:
+            candidates.append(("rdp", rdp_role, rdp_features))
 
         flow_key = (segment.src, segment.sport, segment.dst, segment.dport)
         banner = parse_ssh_banner(segment.payload)

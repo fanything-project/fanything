@@ -6,7 +6,7 @@
 <img width="200" height="239" alt="f" src="https://github.com/user-attachments/assets/e2e096fd-1ae5-4090-92b8-1e0a2fe85a4a" />
 
 
-`fanything` is an awesome, patent-unencumbered fingerprinting format for correlating SSH, TLS, DTLS, X.509 certificate, QUIC, IKE, and TCP/IP stack behavior.
+`fanything` is an awesome, patent-unencumbered fingerprinting format for correlating SSH, TLS, DTLS, X.509 certificate, QUIC, IKE, RDP, and TCP/IP stack behavior.
 
 The repository defines an algorithm named **FAN/1** (Flexible Anything
 Network fingerprint, version 1). FAN/1 is intentionally simple: each
@@ -24,7 +24,7 @@ fan1:<protocol>:<role>:<mode>:<base64url-normalized-features>:<digest-algorithm>
 ```
 
 * `fan1` identifies the algorithm version.
-* `<protocol>` is currently `tls`, `dtls`, `x509`, `ssh`, `quic`, `ike`, or `tcpip`, but the
+* `<protocol>` is currently `tls`, `dtls`, `x509`, `ssh`, `quic`, `ike`, `rdp`, or `tcpip`, but the
   namespace can be extended to other services and transport behaviors.
 * `<role>` identifies handshake direction, for example `client`, `server`, or
   `peer`.
@@ -99,6 +99,8 @@ correlation meaning.
 * For TCP/IP stack fingerprints, `client` identifies a SYN without ACK and
   `server` identifies a SYN-ACK. These roles answer: "what TCP/IP stack
   behavior appeared in the connection setup packet?"
+* For RDP X.224 fingerprints, `client` identifies a Connection Request and
+  `server` identifies a Connection Confirm.
 
 In practical correlation, treat `client`, `server`, and `peer` as different
 attribute types even when the same protocol is involved. For example, a TLS
@@ -198,6 +200,21 @@ Normalization rules:
 See [documentation/TCPIP.md](documentation/TCPIP.md) for the complete TCP/IP
 stack fingerprint field reference.
 
+### RDP X.224 fingerprints
+
+RDP fingerprints currently cover the initial TPKT/X.224 connection exchange.
+If an RDP Negotiation Request or Response is present in the same TPKT packet,
+its fixed fields are included. Later MCS, CredSSP, TLS, and encrypted RDP
+layers are not decoded by the RDP parser.
+
+```text
+rdp|client|tpkt_v=<tpkt_version>|tpkt_rsv=<tpkt_reserved>|tpkt_len=<tpkt_length>|x224_len=<x224_length_indicator>|pdu=<x224_pdu_type>|dst_ref=<destination_reference>|src_ref=<source_reference>|class=<class_option>|neg_type=<rdp_negotiation_type>|neg_flags=<rdp_negotiation_flags>|neg_len=<rdp_negotiation_length>|neg_proto=<requested_protocols>|neg_selected=<selected_protocol>
+rdp|server|tpkt_v=<tpkt_version>|tpkt_rsv=<tpkt_reserved>|tpkt_len=<tpkt_length>|x224_len=<x224_length_indicator>|pdu=<x224_pdu_type>|dst_ref=<destination_reference>|src_ref=<source_reference>|class=<class_option>|neg_type=<rdp_negotiation_type>|neg_flags=<rdp_negotiation_flags>|neg_len=<rdp_negotiation_length>|neg_proto=<requested_protocols>|neg_selected=<selected_protocol>
+```
+
+See [documentation/RDP.md](documentation/RDP.md) for the complete RDP X.224
+field reference.
+
 ### DTLS fingerprints
 
 DTLS fingerprints use the same TLS-family field shape under the `dtls`
@@ -296,6 +313,7 @@ Active service probing with Nmap NSE:
 ```bash
 nmap -Pn -p443 --script ./fanything-tls.nse 192.0.2.20
 nmap -sU -p4433 --script ./fanything-dtls.nse 192.0.2.20
+nmap -Pn -p3389 --script ./fanything-rdp.nse 192.0.2.20
 nmap -Pn -p22 --script ./fanything-ssh.nse 192.0.2.20
 ```
 
@@ -320,6 +338,14 @@ for testing:
 
 ```bash
 nmap -sU -p4433 --script ./fanything-dtls.nse --script-args fanything-dtls.dtls-version=DTLSv1.3 192.0.2.20
+```
+
+The RDP NSE script sends a TPKT/X.224 Connection Request with an RDP
+Negotiation Request, then fingerprints the server X.224 Connection Confirm and
+same-packet Negotiation Response when present:
+
+```bash
+nmap -Pn -p3389 --script ./fanything-rdp.nse 192.0.2.20
 ```
 
 The SSH NSE script sends an SSH identification string, reads the server
@@ -366,5 +392,5 @@ Recommended storage approaches:
   back to packets.
 
 Because FAN/1 embeds the protocol, role, and collection mode in the fingerprint,
-mixed SSH, TLS, DTLS, QUIC, IKE, and future service fingerprints can share the
-same attribute namespace without losing type information.
+mixed SSH, TLS, DTLS, QUIC, IKE, RDP, and future service fingerprints can share
+the same attribute namespace without losing type information.

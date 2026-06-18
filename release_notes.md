@@ -7,3 +7,6 @@
 * Document DTLS FAN/1 feature strings and active scan defaults.
 * Document TLS and DTLS active cipher-suite ordering against Firefox ESR 140 /
   NSS `SSL_ImplementedCiphers[]`.
+* Add passive RDP TPKT/X.224 Connection Request and Connection Confirm
+  fingerprinting, including same-packet RDP Negotiation fields.
+* Add active RDP X.224 probing with `fanything-rdp.nse`.
