@@ -69,7 +69,8 @@ TLS 1.3 and TLS 1.2 active cipher lists are pinned to the current Firefox
 LTS/ESR baseline used by this project: Firefox ESR 140 series, latest listed
 ESR point release `140.12.0` when checked on 2026-06-18, using NSS
 `SSL_ImplementedCiphers[]` order from `mozilla-esr140`. DTLS active probing
-uses the same modern TLS-family cipher baseline.
+uses the same modern TLS-family cipher baseline. Exact Mozilla source URLs and
+tables are documented in `active_scan.md`.
 
 Default protocol order:
 
