@@ -283,6 +283,60 @@ local f_quic_dcil      = Field.new("quic.dcil")
 local f_quic_scil      = Field.new("quic.scil")
 local f_quic_length    = Field.new("quic.length")
 
+-- DTLS fields — confirmed against Wireshark 4.x.
+-- Check with:  tshark -G fields | grep -E 'dtls\.handshake|dtls\.record'
+-- DTLS uses its own dtls.* namespace; dtls.record.epoch is DTLS-only.
+local f_dtls_epoch    = Field.new("dtls.record.epoch")
+local f_dtls_hs_type  = Field.new("dtls.handshake.type")
+local f_dtls_version  = Field.new("dtls.handshake.version")
+local f_dtls_cipher   = Field.new("dtls.handshake.ciphersuite")
+local f_dtls_ext_type = Field.new("dtls.handshake.extension.type")
+local f_dtls_groups   = Field.new("dtls.handshake.extensions_supported_group")
+local f_dtls_points   = Field.new("dtls.handshake.extensions_ec_point_format")
+local f_dtls_sv       = Field.new("dtls.handshake.extensions.supported_version")
+local f_dtls_alpn     = Field.new("dtls.handshake.extensions_alpn_str")
+local f_dtls_sig      = Field.new("dtls.handshake.sig_hash_alg")
+
+-- IKEv2 / ISAKMP fields — confirmed against Wireshark 4.x.
+-- Check with:  tshark -G fields | grep '^isakmp\.'
+-- isakmp.tf.type = transform type nibble; isakmp.tf.id.* = per-type algorithm IDs.
+-- isakmp.nextpayload appears once per header (IKE + each payload), forming a chain.
+local f_ike_mjver       = Field.new("isakmp.mjver")
+local f_ike_mnver       = Field.new("isakmp.mnver")
+local f_ike_exchtype    = Field.new("isakmp.exchangetype")
+local f_ike_flags       = Field.new("isakmp.flags")
+local f_ike_nextpay     = Field.new("isakmp.nextpayload")
+local f_ike_prop_proto  = Field.new("isakmp.prop.protoid")
+local f_ike_prop_ntrans = Field.new("isakmp.prop.transforms")
+local f_ike_tf_type     = Field.new("isakmp.tf.type")
+local f_ike_tf_encr     = Field.new("isakmp.tf.id.encr")
+local f_ike_tf_prf      = Field.new("isakmp.tf.id.prf")
+local f_ike_tf_integ    = Field.new("isakmp.tf.id.integ")
+local f_ike_tf_dh       = Field.new("isakmp.tf.id.dh")
+local f_ike_tf_esn      = Field.new("isakmp.tf.id.esn")
+local f_ike_klen        = Field.new("isakmp.ike2.attr.key_length")
+local f_ike_ke_group    = Field.new("isakmp.key_exchange.dh_group")
+local f_ike_notify      = Field.new("isakmp.notify.msgtype")
+
+-- RDP / TPKT / X.224 (COTP) fields — confirmed against Wireshark 4.x.
+-- Check with:  tshark -G fields | grep -E '^(tpkt|cotp|rdp)\.'
+-- cotp.type stores the upper nibble (13 = CC/server 0xD0, 14 = CR/client 0xE0).
+-- Full PDU byte = cotp.type * 16 + cotp.class.
+local f_tpkt_version      = Field.new("tpkt.version")
+local f_tpkt_reserved     = Field.new("tpkt.reserved")
+local f_tpkt_length       = Field.new("tpkt.length")
+local f_cotp_li           = Field.new("cotp.li")
+local f_cotp_type         = Field.new("cotp.type")
+local f_cotp_destref      = Field.new("cotp.destref")
+local f_cotp_srcref       = Field.new("cotp.srcref")
+local f_cotp_class        = Field.new("cotp.class")
+local f_rdp_neg_type      = Field.new("rdp.neg_type")
+local f_rdp_neg_len       = Field.new("rdp.neg_length")
+local f_rdp_neg_req_flags = Field.new("rdp.negReq.flags")
+local f_rdp_neg_req_proto = Field.new("rdp.negReq.requestedProtocols")
+local f_rdp_neg_rsp_flags = Field.new("rdp.negRsp.flags")
+local f_rdp_neg_sel_proto = Field.new("rdp.negReq.selectedProtocol")
+
 -- Per-stream banner cache: stream_index → {client=..., server=...}
 -- The SSH banner arrives in its own TCP segment before KEXINIT; we cache it
 -- here so we can include id= in the KEXINIT fingerprint.
@@ -297,6 +351,10 @@ local function tls_fingerprints()
     -- QUIC frames carry TLS inside CRYPTO frames; skip here so quic_fingerprints()
     -- handles them exclusively and avoids duplicate entries.
     if #{ f_quic_version() } > 0 then return results end
+
+    -- DTLS frames use dtls.handshake.* fields; skip here so dtls_fingerprints()
+    -- handles them exclusively and avoids duplicate entries.
+    if #{ f_dtls_epoch() } > 0 then return results end
 
     -- Collect all handshake types present in this frame
     local hs_types = collect_ints(f_tls_hs_type)
@@ -509,6 +567,217 @@ local function quic_fingerprints()
     return results
 end
 
+-- ─── DTLS fingerprinting ─────────────────────────────────────────────────────
+
+-- Returns a list of {role, features} pairs for DTLS ClientHello/ServerHello frames.
+-- Feature strings match fanfp.py tls_{client,server}_features(protocol="dtls"):
+--   client: dtls|client|v=…|c=…|e=…|g=…|p=…|sv=…|alpn=…|sig=…
+--   server: dtls|server|v=…|c=…|e=…|sv=…
+local function dtls_fingerprints()
+    local results = {}
+
+    if #{ f_dtls_epoch() } == 0 then return results end
+
+    local hs_types = collect_ints(f_dtls_hs_type)
+    if #hs_types == 0 then return results end
+
+    local versions  = collect_ints(f_dtls_version)
+    local ciphers   = collect_ints(f_dtls_cipher)
+    local ext_types = collect_ints(f_dtls_ext_type)
+    local groups    = collect_ints(f_dtls_groups)
+    local points    = collect_ints(f_dtls_points)
+    local sv_list   = collect_ints(f_dtls_sv)
+    local alpn_list = collect_strs(f_dtls_alpn)
+    local sigs      = collect_ints(f_dtls_sig)
+
+    local version = versions[1] or 0
+
+    for _, hs_type in ipairs(hs_types) do
+        if hs_type == 1 then
+            local features = string.format(
+                "dtls|client|v=%d|c=%s|e=%s|g=%s|p=%s|sv=%s|alpn=%s|sig=%s",
+                version,
+                join_ints(ciphers,   true),
+                join_ints(ext_types, true),
+                join_ints(groups,    false),
+                join_ints(points,    false),
+                join_ints(sv_list,   true),
+                table.concat(alpn_list, ","),
+                join_ints(sigs,      false))
+            results[#results+1] = { role = "client", features = features }
+
+        elseif hs_type == 2 then
+            local features = string.format(
+                "dtls|server|v=%d|c=%s|e=%s|sv=%s",
+                version,
+                tostring(ciphers[1] or ""),
+                join_ints(ext_types, true),
+                tostring(sv_list[1] or ""))
+            results[#results+1] = { role = "server", features = features }
+        end
+    end
+
+    return results
+end
+
+-- ─── IKEv2 fingerprinting ────────────────────────────────────────────────────
+
+-- Build the SA payload feature string from Wireshark ISAKMP fields.
+-- Groups transforms by proposal using isakmp.prop.transforms (count per proposal).
+-- ENCR transforms (type 1) with isakmp.ike2.attr.key_length get a ".bits" suffix.
+local function ike_build_sa()
+    local prop_protos   = collect_ints(f_ike_prop_proto)
+    local prop_ntrans   = collect_ints(f_ike_prop_ntrans)
+    local tf_types      = collect_ints(f_ike_tf_type)
+    local encr_ids      = collect_ints(f_ike_tf_encr)
+    local prf_ids       = collect_ints(f_ike_tf_prf)
+    local integ_ids     = collect_ints(f_ike_tf_integ)
+    local dh_ids        = collect_ints(f_ike_tf_dh)
+    local esn_ids       = collect_ints(f_ike_tf_esn)
+    local klens         = collect_ints(f_ike_klen)
+
+    if #prop_protos == 0 then return "" end
+
+    local id_cursors = {
+        [1] = {encr_ids,  1},
+        [2] = {prf_ids,   1},
+        [3] = {integ_ids, 1},
+        [4] = {dh_ids,    1},
+        [5] = {esn_ids,   1},
+    }
+    local klen_cursor = 1
+    local tf_idx      = 1
+
+    local proposals = {}
+    for p = 1, #prop_protos do
+        local proto  = prop_protos[p]
+        -- If prop.transforms is missing, put all remaining transforms in one proposal
+        local ntrans = (prop_ntrans[p] and prop_ntrans[p] > 0 and prop_ntrans[p])
+                       or (p == 1 and #tf_types) or 0
+        local transforms = {}
+
+        for _ = 1, ntrans do
+            if tf_idx > #tf_types then break end
+            local ttype = tf_types[tf_idx]
+            tf_idx = tf_idx + 1
+
+            local tid    = 0
+            local cursor = id_cursors[ttype]
+            if cursor then
+                local ids, cidx = cursor[1], cursor[2]
+                if cidx <= #ids then
+                    tid = ids[cidx]
+                    cursor[2] = cidx + 1
+                end
+            end
+
+            local t_str = tostring(ttype) .. "=" .. tostring(tid)
+            if ttype == 1 and klen_cursor <= #klens then
+                t_str = t_str .. "." .. tostring(klens[klen_cursor])
+                klen_cursor = klen_cursor + 1
+            end
+            transforms[#transforms+1] = t_str
+        end
+
+        proposals[#proposals+1] = tostring(proto) .. ":" .. table.concat(transforms, ",")
+    end
+
+    return table.concat(proposals, ";")
+end
+
+-- Returns a list of {role, features} pairs for IKEv2 frames.
+-- Only IKEv2 (major version 2) is fingerprinted.  Role is determined by the
+-- R flag (0x20): set = responder, clear = initiator.
+-- Payload type list is derived from all isakmp.nextpayload values in the frame:
+-- they form a chain [type_of_p1, type_of_p2, …, 0]; non-zero values = payload types.
+local function ike_fingerprints()
+    local results = {}
+
+    local mjver_fi = { f_ike_mjver() }
+    if #mjver_fi == 0 then return results end
+    local major = mjver_fi[1].value
+    if major ~= 2 then return results end
+
+    local function fval(fn) local fi={fn()}; return (#fi>0 and fi[1].value) or 0 end
+
+    local mnver  = fval(f_ike_mnver)
+    local exch   = fval(f_ike_exchtype)
+    local flags  = fval(f_ike_flags)
+    local role   = (_band(flags, 0x20) ~= 0) and "responder" or "initiator"
+
+    local all_np = collect_ints(f_ike_nextpay)
+    local np     = all_np[1] or 0
+    local ptypes = {}
+    for _, v in ipairs(all_np) do
+        if v ~= 0 then ptypes[#ptypes+1] = tostring(v) end
+    end
+
+    local sa       = ike_build_sa()
+    local ke_fi    = { f_ike_ke_group() }
+    local ke_group = (#ke_fi > 0 and tostring(ke_fi[1].value)) or ""
+    local notifies = collect_ints(f_ike_notify)
+
+    local features = string.format(
+        "ike|%s|v=%d.%d|ex=%d|flags=%d|np=%d|p=%s|sa=%s|ke=%s|n=%s",
+        role, major, mnver, exch, flags, np,
+        table.concat(ptypes, "-"), sa, ke_group, join_ints(notifies, false))
+
+    results[#results+1] = { role = role, features = features }
+    return results
+end
+
+-- ─── RDP X.224 fingerprinting ────────────────────────────────────────────────
+
+-- Returns a list of {role, features} pairs for RDP X.224 Connection Request
+-- (CR, client, cotp.type=14/0xE0) and Connection Confirm (CC, server, cotp.type=13/0xD0).
+-- Full PDU byte = cotp.type * 16 + cotp.class  (type nibble left-shifted by 4).
+local function rdp_fingerprints()
+    local results = {}
+
+    local cotp_fi = { f_cotp_type() }
+    if #cotp_fi == 0 then return results end
+    local cotp_type = cotp_fi[1].value
+    if cotp_type ~= 13 and cotp_type ~= 14 then return results end
+
+    local function fval(fn) local fi={fn()}; return (#fi>0 and fi[1].value) or 0 end
+    local function fstr(fn) local fi={fn()}; return (#fi>0 and tostring(fi[1].value)) or "" end
+
+    local tpkt_v   = fval(f_tpkt_version)
+    local tpkt_rsv = fval(f_tpkt_reserved)
+    local tpkt_len = fval(f_tpkt_length)
+    local x224_len = fval(f_cotp_li)
+    local cotp_cls = fval(f_cotp_class)
+    local pdu      = cotp_type * 16 + cotp_cls
+    local dst_ref  = fval(f_cotp_destref)
+    local src_ref  = fval(f_cotp_srcref)
+    local role     = (cotp_type == 13) and "server" or "client"
+
+    local neg_type     = fstr(f_rdp_neg_type)
+    local neg_len      = fstr(f_rdp_neg_len)
+    local neg_flags    = ""
+    local neg_proto    = ""
+    local neg_selected = ""
+
+    if cotp_type == 14 then
+        neg_flags = fstr(f_rdp_neg_req_flags)
+        neg_proto = fstr(f_rdp_neg_req_proto)
+    else
+        neg_flags    = fstr(f_rdp_neg_rsp_flags)
+        neg_selected = fstr(f_rdp_neg_sel_proto)
+    end
+
+    local features = string.format(
+        "rdp|%s|tpkt_v=%d|tpkt_rsv=%d|tpkt_len=%d|x224_len=%d"
+        .. "|pdu=%d|dst_ref=%d|src_ref=%d|class=%d"
+        .. "|neg_type=%s|neg_flags=%s|neg_len=%s|neg_proto=%s|neg_selected=%s",
+        role, tpkt_v, tpkt_rsv, tpkt_len, x224_len,
+        pdu, dst_ref, src_ref, cotp_cls,
+        neg_type, neg_flags, neg_len, neg_proto, neg_selected)
+
+    results[#results+1] = { role = role, features = features }
+    return results
+end
+
 -- ─── Main dissector ───────────────────────────────────────────────────────────
 
 function p_fanfp.dissector(tvb, pinfo, root)
@@ -527,6 +796,30 @@ function p_fanfp.dissector(tvb, pinfo, root)
     if ok3 then
         for _, fp in ipairs(quic_fps) do
             candidates[#candidates+1] = { protocol = "quic", role = fp.role, features = fp.features }
+        end
+    end
+
+    -- DTLS
+    local ok4, dtls_fps = pcall(dtls_fingerprints)
+    if ok4 then
+        for _, fp in ipairs(dtls_fps) do
+            candidates[#candidates+1] = { protocol = "dtls", role = fp.role, features = fp.features }
+        end
+    end
+
+    -- IKEv2
+    local ok5, ike_fps = pcall(ike_fingerprints)
+    if ok5 then
+        for _, fp in ipairs(ike_fps) do
+            candidates[#candidates+1] = { protocol = "ike", role = fp.role, features = fp.features }
+        end
+    end
+
+    -- RDP X.224
+    local ok6, rdp_fps = pcall(rdp_fingerprints)
+    if ok6 then
+        for _, fp in ipairs(rdp_fps) do
+            candidates[#candidates+1] = { protocol = "rdp", role = fp.role, features = fp.features }
         end
     end
 
