@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract FAN/1 SSH and TLS fingerprints from pcap or pcapng files."""
+"""Extract FAN/1 SSH, TLS, QUIC, IKE, and TCP/IP fingerprints from captures."""
 
 from __future__ import annotations
 
@@ -112,6 +112,14 @@ class TcpSegment:
     sport: int
     dport: int
     payload: bytes
+    flags: int = 0
+    window: int = 0
+    ttl: int = 0
+    ip_version: int = 0
+    ip_len: int = 0
+    ip_df: bool = False
+    ip_id: int = 0
+    tcp_options: bytes = b""
 
     @property
     def flow(self) -> Dict[str, object]:
@@ -233,7 +241,11 @@ def ipv4_tcp(index: int, data: bytes) -> Iterator[TcpSegment]:
         return
     src = str(ipaddress.IPv4Address(data[12:16]))
     dst = str(ipaddress.IPv4Address(data[16:20]))
-    yield from parse_tcp(index, src, dst, data[ihl:total])
+    flags = struct.unpack_from("!H", data, 6)[0]
+    df = bool(flags & 0x4000)
+    ip_id = struct.unpack_from("!H", data, 4)[0]
+    ttl = data[8]
+    yield from parse_tcp(index, src, dst, data[ihl:total], ttl, 4, total, df, ip_id)
 
 
 def ipv4_udp(index: int, data: bytes) -> Iterator[UdpDatagram]:
@@ -254,7 +266,8 @@ def ipv6_tcp(index: int, data: bytes) -> Iterator[TcpSegment]:
     plen = struct.unpack_from("!H", data, 4)[0]
     src = str(ipaddress.IPv6Address(data[8:24]))
     dst = str(ipaddress.IPv6Address(data[24:40]))
-    yield from parse_tcp(index, src, dst, data[40 : 40 + plen])
+    ttl = data[7]
+    yield from parse_tcp(index, src, dst, data[40 : 40 + plen], ttl, 6, plen + 40, False, 0)
 
 
 def ipv6_udp(index: int, data: bytes) -> Iterator[UdpDatagram]:
@@ -266,15 +279,126 @@ def ipv6_udp(index: int, data: bytes) -> Iterator[UdpDatagram]:
     yield from parse_udp(index, src, dst, data[40 : 40 + plen])
 
 
-def parse_tcp(index: int, src: str, dst: str, data: bytes) -> Iterator[TcpSegment]:
+def parse_tcp(
+    index: int,
+    src: str,
+    dst: str,
+    data: bytes,
+    ttl: int,
+    ip_version: int,
+    ip_len: int,
+    ip_df: bool,
+    ip_id: int,
+) -> Iterator[TcpSegment]:
     if len(data) < 20:
         return
     sport, dport = struct.unpack_from("!HH", data, 0)
     off = ((data[12] >> 4) & 0x0F) * 4
+    if off < 20 or len(data) < off:
+        return
+    flags = data[13]
+    window = struct.unpack_from("!H", data, 14)[0]
+    tcp_options = data[20:off]
     payload = data[off:]
-    if payload:
-        yield TcpSegment(index, src, dst, sport, dport, payload)
+    yield TcpSegment(
+        index, src, dst, sport, dport, payload, flags, window, ttl,
+        ip_version, ip_len, ip_df, ip_id, tcp_options
+    )
 
+
+def tcp_option_tokens(options: bytes) -> Tuple[List[str], Dict[str, object], List[str]]:
+    """Parse TCP options into ordered passive stack fingerprint tokens."""
+    tokens: List[str] = []
+    values: Dict[str, object] = {}
+    quirks: List[str] = []
+    offset = 0
+    while offset < len(options):
+        kind = options[offset]
+        if kind == 0:
+            tokens.append("eol")
+            if any(options[offset + 1:]):
+                quirks.append("nz-eol-pad")
+            break
+        if kind == 1:
+            tokens.append("nop")
+            offset += 1
+            continue
+        if offset + 1 >= len(options):
+            tokens.append(f"bad{kind}")
+            quirks.append("trunc-opt")
+            break
+        length = options[offset + 1]
+        if length < 2 or offset + length > len(options):
+            tokens.append(f"bad{kind}")
+            quirks.append("bad-opt-len")
+            break
+        data = options[offset + 2:offset + length]
+        if kind == 2 and len(data) == 2:
+            mss = struct.unpack("!H", data)[0]
+            tokens.append(f"mss{mss}")
+            values["mss"] = mss
+        elif kind == 3 and len(data) == 1:
+            wscale = data[0]
+            tokens.append(f"ws{wscale}")
+            values["wscale"] = wscale
+        elif kind == 4 and not data:
+            tokens.append("sackok")
+            values["sackok"] = True
+        elif kind == 5:
+            tokens.append(f"sack{len(data)}")
+        elif kind == 8 and len(data) == 8:
+            ts1, ts2 = struct.unpack("!II", data)
+            tokens.append("ts")
+            values["ts"] = "nz" if ts1 else "zero"
+            if ts2:
+                quirks.append("ts-echo-nz")
+        elif kind == 34:
+            tokens.append("tfo")
+        else:
+            tokens.append(f"opt{kind}:{data.hex()}")
+        offset += length
+    return tokens, values, quirks
+
+
+def ttl_bucket(ttl: int) -> int:
+    for candidate in (32, 64, 128, 255):
+        if ttl <= candidate:
+            return candidate
+    return ttl
+
+
+def tcpip_features(segment: TcpSegment) -> Optional[Tuple[str, str]]:
+    syn = bool(segment.flags & 0x02)
+    ack = bool(segment.flags & 0x10)
+    rst = bool(segment.flags & 0x04)
+    fin = bool(segment.flags & 0x01)
+    if not syn or rst or fin:
+        return None
+
+    role = "server" if ack else "client"
+    tokens, values, quirks = tcp_option_tokens(segment.tcp_options)
+    if segment.payload:
+        quirks.append("data-in-syn")
+    if segment.ip_version == 4 and not segment.ip_df:
+        quirks.append("no-df")
+    if segment.ip_version == 4 and segment.ip_df and segment.ip_id:
+        quirks.append("df-nz-id")
+
+    opt_layout = ",".join(tokens)
+    mss = values.get("mss", "")
+    wscale = values.get("wscale", "")
+    sackok = "1" if values.get("sackok") else "0"
+    ts = values.get("ts", "")
+    # tcpip2 is a passive SinFP3-adjacent signature.  It keeps the classic
+    # single-packet TCP/IP stack signals (TTL, window, MSS, option order), and
+    # adds normalized option layout plus passive OS-fingerprinting quirk flags.
+    features = (
+        f"tcpip2|{role}|ip={segment.ip_version}|ttl={segment.ttl}|it={ttl_bucket(segment.ttl)}"
+        f"|olen={len(segment.tcp_options)}|win={segment.window}|mss={mss}|ws={wscale}"
+        f"|sack={sackok}|ts={ts}|opts={opt_layout}|df={int(segment.ip_df)}"
+        f"|plen={len(segment.payload)}|ql={join_values(sorted(set(quirks)))}"
+    )
+    return role, features
 
 def parse_udp(index: int, src: str, dst: str, data: bytes) -> Iterator[UdpDatagram]:
     if len(data) < 8:
@@ -842,6 +966,10 @@ def extract(
                     f"skipping malformed TLS record in frame {segment.index}", exc
                 )
             tls = None
+        tcpip = tcpip_features(segment)
+        if tcpip:
+            candidates.append(("tcpip", *tcpip))
+
         if tls:
             candidates.append(("tls", *tls))
 

@@ -6,7 +6,7 @@
 <img width="200" height="239" alt="f" src="https://github.com/user-attachments/assets/e2e096fd-1ae5-4090-92b8-1e0a2fe85a4a" />
 
 
-`fanything` is an awesome, patent-unencumbered fingerprinting format for correlating SSH, TLS, QUIC handshakes and more.
+`fanything` is an awesome, patent-unencumbered fingerprinting format for correlating SSH, TLS, QUIC, IKE, and TCP/IP stack behavior.
 
 The repository defines an algorithm named **FAN/1** (Flexible Anything
 Network fingerprint, version 1). FAN/1 is intentionally simple: each
@@ -24,8 +24,8 @@ fan1:<protocol>:<role>:<mode>:<base64url-normalized-features>:<digest-algorithm>
 ```
 
 * `fan1` identifies the algorithm version.
-* `<protocol>` is currently `tls`, `ssh`, or `quic`, but the namespace can be
-  extended to other services.
+* `<protocol>` is currently `tls`, `ssh`, `quic`, `ike`, or `tcpip`, but the
+  namespace can be extended to other services and transport behaviors.
 * `<role>` identifies handshake direction, for example `client`, `server`, or
   `peer`.
 * `<mode>` is `active` or `passive`.
@@ -95,6 +95,9 @@ correlation meaning.
   because both endpoints send an identification string and a `SSH_MSG_KEXINIT`
   packet with the same family of proposal lists. A `peer` fingerprint answers:
   "what SSH implementation behavior did this endpoint advertise?"
+* For TCP/IP stack fingerprints, `client` identifies a SYN without ACK and
+  `server` identifies a SYN-ACK. These roles answer: "what TCP/IP stack
+  behavior appeared in the connection setup packet?"
 
 In practical correlation, treat `client`, `server`, and `peer` as different
 attribute types even when the same protocol is involved. For example, a TLS
@@ -126,6 +129,43 @@ Normalization rules:
 * Lists preserve wire order because order is often behaviorally meaningful.
 * GREASE values are removed from TLS lists before canonicalization.
 * Missing fields are represented as empty strings.
+
+
+### TCP/IP stack fingerprints
+
+TCP/IP stack fingerprints are passive, single-packet fingerprints for TCP SYN
+and SYN-ACK packets. They are intentionally close to the SinFP family of TCP/IP
+stack signatures while remaining within the FAN/1 feature-string model. The
+extractor records IP-level signals, TCP header values, ordered TCP options, and
+packet quirks that are useful for implementation and operating-system
+correlation.
+
+```text
+tcpip2|<role>|ip=<ip_version>|ttl=<observed_ttl_or_hop_limit>|it=<initial_ttl_bucket>|olen=<tcp_options_length>|win=<tcp_window>|mss=<mss>|ws=<window_scale>|sack=<0_or_1>|ts=<zero_or_nz>|opts=<ordered_tcp_options>|df=<0_or_1>|plen=<tcp_payload_length>|ql=<quirks>
+```
+
+Roles:
+
+* `client` is emitted for SYN packets without ACK.
+* `server` is emitted for SYN-ACK packets.
+
+Normalization rules:
+
+* TCP option order is preserved because option layout is behaviorally
+  meaningful.
+* Recognized options are normalized as `mss<value>`, `ws<value>`, `sackok`,
+  `sack<length>`, `ts`, `tfo`, `nop`, and `eol`; unknown options are retained
+  as `opt<kind>:<hex_payload>`.
+* The `it` field buckets observed TTL/hop-limit to common initial values: `32`,
+  `64`, `128`, or `255`.
+* Missing option-derived values are emitted as empty strings, and SACK-permitted
+  is emitted as `0` or `1`.
+* Quirk flags are sorted and de-duplicated; currently emitted quirks include
+  malformed/truncated options, non-zero EOL padding, SYN payloads, missing IPv4
+  DF, non-zero IPv4 ID with DF, and non-zero timestamp echo in SYN/SYN-ACK.
+
+See [documentation/TCPIP.md](documentation/TCPIP.md) for the complete TCP/IP
+stack fingerprint field reference.
 
 ### SSH fingerprints
 
