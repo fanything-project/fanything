@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract FAN/1 SSH, TLS, QUIC, IKE, and TCP/IP fingerprints from captures."""
+"""Extract FAN/1 SSH, TLS, X.509, QUIC, IKE, and TCP/IP fingerprints from captures."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import struct
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple, Union
+from typing import Callable, Dict, Iterable, Iterator, List, NamedTuple, Optional, Tuple, Union
 
 try:
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -25,6 +25,7 @@ except Exception:  # pragma: no cover - optional QUIC Initial decryption support
 TLS_HANDSHAKE = 22
 TLS_CLIENT_HELLO = 1
 TLS_SERVER_HELLO = 2
+TLS_CERTIFICATE = 11
 SSH_MSG_KEXINIT = 20
 QUIC_INITIAL = 0
 IKEV2_SA = 33
@@ -421,7 +422,230 @@ def read_vec(data: bytes, offset: int, length_size: int) -> Tuple[bytes, int]:
     return data[offset : offset + length], offset + length
 
 
-def parse_tls_handshake(payload: bytes, strict: bool = False) -> Optional[Tuple[str, str]]:
+class DerNode(NamedTuple):
+    tag: int
+    value: bytes
+    children: List["DerNode"]
+
+
+def read_der_length(data: bytes, offset: int) -> Tuple[int, int]:
+    if offset >= len(data):
+        raise ValueError("truncated DER length")
+    first = data[offset]
+    offset += 1
+    if first < 0x80:
+        return first, offset
+    length_len = first & 0x7F
+    if length_len == 0 or length_len > 4 or offset + length_len > len(data):
+        raise ValueError("invalid DER length")
+    return int.from_bytes(data[offset : offset + length_len], "big"), offset + length_len
+
+
+def parse_der_node(data: bytes, offset: int = 0) -> Tuple[DerNode, int]:
+    if offset >= len(data):
+        raise ValueError("truncated DER tag")
+    tag = data[offset]
+    length, value_offset = read_der_length(data, offset + 1)
+    end = value_offset + length
+    if end > len(data):
+        raise ValueError("truncated DER value")
+    value = data[value_offset:end]
+    children: List[DerNode] = []
+    if tag & 0x20:
+        child_offset = 0
+        while child_offset < len(value):
+            child, child_offset = parse_der_node(value, child_offset)
+            children.append(child)
+    return DerNode(tag, value, children), end
+
+
+def der_oid(value: bytes) -> str:
+    if not value:
+        return ""
+    first = value[0]
+    parts = [first // 40, first % 40]
+    n = 0
+    for byte in value[1:]:
+        n = (n << 7) | (byte & 0x7F)
+        if not byte & 0x80:
+            parts.append(n)
+            n = 0
+    return ".".join(str(part) for part in parts)
+
+
+def der_int_len(node: DerNode) -> str:
+    return str(len(node.value.lstrip(b"\x00") or b"\x00"))
+
+
+def der_text(node: DerNode) -> str:
+    if node.tag in (0x0C, 0x16, 0x13, 0x14, 0x1A):
+        return node.value.decode("utf-8", "replace").replace("|", "\\|").replace(",", "\\,")
+    if node.tag == 0x1E:
+        try:
+            return node.value.decode("utf-16-be", "replace").replace("|", "\\|").replace(",", "\\,")
+        except UnicodeDecodeError:
+            return node.value.hex()
+    return node.value.hex()
+
+
+def der_time_days(not_before: DerNode, not_after: DerNode) -> str:
+    from datetime import datetime
+
+    def parse_time(node: DerNode) -> Optional[datetime]:
+        text = node.value.decode("ascii", "ignore")
+        formats = ["%y%m%d%H%M%SZ"] if node.tag == 0x17 else ["%Y%m%d%H%M%SZ"]
+        for fmt in formats:
+            try:
+                return datetime.strptime(text, fmt)
+            except ValueError:
+                pass
+        return None
+
+    start = parse_time(not_before)
+    end = parse_time(not_after)
+    return str((end - start).days) if start and end else ""
+
+
+def x509_name_features(name: DerNode) -> str:
+    attrs: List[str] = []
+    for rdn in name.children:
+        for attr in rdn.children:
+            if len(attr.children) >= 2:
+                attrs.append(f"{der_oid(attr.children[0].value)}={der_text(attr.children[1])}")
+    return ",".join(attrs)
+
+
+def parse_general_names(data: bytes) -> str:
+    try:
+        seq, _ = parse_der_node(data)
+    except ValueError:
+        return ""
+    names: List[str] = []
+    for name in seq.children:
+        tag = name.tag
+        if tag == 0x82:
+            names.append("dns:" + name.value.decode("ascii", "replace"))
+        elif tag == 0x87:
+            try:
+                names.append("ip:" + str(ipaddress.ip_address(name.value)))
+            except ValueError:
+                names.append("ip:" + name.value.hex())
+        elif tag == 0x81:
+            names.append("email:" + name.value.decode("ascii", "replace"))
+        elif tag == 0x86:
+            names.append("uri:" + name.value.decode("ascii", "replace"))
+        elif tag == 0x88:
+            names.append("oid:" + der_oid(name.value))
+        else:
+            names.append(f"gn{tag}:{hashlib.sha256(name.value).hexdigest()[:16]}")
+    return ",".join(names)
+
+
+def parse_x509_certificate_features(cert: bytes, index: int = 0) -> str:
+    root, end = parse_der_node(cert)
+    if end != len(cert) or root.tag != 0x30 or len(root.children) < 3:
+        raise ValueError("invalid X.509 certificate")
+    tbs = root.children[0]
+    outer_sig_oid = der_oid(root.children[1].children[0].value) if root.children[1].children else ""
+    off = 0
+    version = "1"
+    if tbs.children and tbs.children[0].tag == 0xA0:
+        version = str(int.from_bytes(tbs.children[0].children[0].value, "big") + 1)
+        off = 1
+    serial_len = der_int_len(tbs.children[off]); off += 1
+    tbs_sig_oid = der_oid(tbs.children[off].children[0].value) if tbs.children[off].children else ""; off += 1
+    issuer = x509_name_features(tbs.children[off]); off += 1
+    validity = tbs.children[off]; off += 1
+    validity_days = der_time_days(validity.children[0], validity.children[1]) if len(validity.children) >= 2 else ""
+    subject = x509_name_features(tbs.children[off]); off += 1
+    spki = tbs.children[off]; off += 1
+    spki_alg = der_oid(spki.children[0].children[0].value) if spki.children and spki.children[0].children else ""
+    spki_param = ""
+    if spki.children and len(spki.children[0].children) > 1:
+        param = spki.children[0].children[1]
+        spki_param = der_oid(param.value) if param.tag == 0x06 else param.value.hex()
+    pubkey_bits = str(max(0, len(spki.children[1].value) * 8 - 8)) if len(spki.children) > 1 and spki.children[1].tag == 0x03 else ""
+    ext_oids: List[str] = []
+    san = eku = ku = bc = ski = aki = policies = aia = crldp = nc = ""
+    for node in tbs.children[off:]:
+        if node.tag != 0xA3 or not node.children:
+            continue
+        for ext in node.children[0].children:
+            if len(ext.children) < 2:
+                continue
+            oid = der_oid(ext.children[0].value)
+            critical = "0"
+            val_node = ext.children[1]
+            if val_node.tag == 0x01 and len(ext.children) > 2:
+                critical = "1" if val_node.value != b"\x00" else "0"
+                val_node = ext.children[2]
+            ext_oids.append(f"{critical}:{oid}")
+            val = val_node.value
+            if oid == "2.5.29.17":
+                san = parse_general_names(val)
+            elif oid == "2.5.29.37":
+                eku = "-".join(der_oid(c.value) for c in parse_der_node(val)[0].children)
+            elif oid == "2.5.29.15":
+                ku = val.hex()
+            elif oid == "2.5.29.19":
+                try:
+                    basic = parse_der_node(val)[0]
+                    ca = "0"
+                    path = ""
+                    for child in basic.children:
+                        if child.tag == 0x01:
+                            ca = "1" if child.value != b"\x00" else "0"
+                        elif child.tag == 0x02:
+                            path = str(int.from_bytes(child.value, "big"))
+                    bc = f"ca:{ca},path:{path}"
+                except ValueError:
+                    bc = val.hex()
+            elif oid == "2.5.29.14":
+                ski = hashlib.sha256(val).hexdigest()[:16]
+            elif oid == "2.5.29.35":
+                aki = hashlib.sha256(val).hexdigest()[:16]
+            elif oid == "2.5.29.32":
+                policies = "-".join(der_oid(c.children[0].value) for c in parse_der_node(val)[0].children if c.children)
+            elif oid == "1.3.6.1.5.5.7.1.1":
+                aia = hashlib.sha256(val).hexdigest()[:16]
+            elif oid == "2.5.29.31":
+                crldp = hashlib.sha256(val).hexdigest()[:16]
+            elif oid == "2.5.29.30":
+                nc = hashlib.sha256(val).hexdigest()[:16]
+    return (
+        f"x509|server|idx={index}|ver={version}|serial_len={serial_len}|sig={outer_sig_oid}"
+        f"|tbs_sig={tbs_sig_oid}|issuer={issuer}|subject={subject}|valid_days={validity_days}"
+        f"|spki_alg={spki_alg}|spki_param={spki_param}|pk_bits={pubkey_bits}|san={san}"
+        f"|ku={ku}|eku={eku}|bc={bc}|ski={ski}|aki={aki}|pol={policies}|aia={aia}"
+        f"|crldp={crldp}|nc={nc}|ext={join_values(ext_oids)}"
+    )
+
+
+def parse_tls_certificate_features(body: bytes) -> Iterator[str]:
+    for offset in (0, 1):
+        try:
+            certs, _ = read_vec(body, offset, 3)
+            co = 0
+            index = 0
+            while co < len(certs):
+                cert, co = read_vec(certs, co, 3)
+                features = parse_x509_certificate_features(cert, index)
+                if co < len(certs):
+                    try:
+                        # TLS 1.3 certificate extensions after each certificate.
+                        _, new_co = read_vec(certs, co, 2)
+                        co = new_co
+                    except ValueError:
+                        pass
+                yield features
+                index += 1
+            return
+        except (struct.error, ValueError):
+            continue
+
+
+def parse_tls_handshake(payload: bytes, strict: bool = False) -> List[Tuple[str, str]]:
+    results: List[Tuple[str, str]] = []
     offset = 0
     while offset + 5 <= len(payload):
         content_type = payload[offset]
@@ -429,7 +653,7 @@ def parse_tls_handshake(payload: bytes, strict: bool = False) -> Optional[Tuple[
         if offset + 5 + rec_len > len(payload):
             if strict:
                 raise ValueError("truncated TLS record")
-            return None
+            return results
         record = payload[offset + 5 : offset + 5 + rec_len]
         offset += 5 + rec_len
         if content_type != TLS_HANDSHAKE or len(record) < 4:
@@ -439,18 +663,20 @@ def parse_tls_handshake(payload: bytes, strict: bool = False) -> Optional[Tuple[
         if 4 + hs_len > len(record):
             if strict:
                 raise ValueError("truncated TLS handshake")
-            return None
+            return results
         body = record[4 : 4 + hs_len]
         try:
             if hs_type == TLS_CLIENT_HELLO:
-                return "client", tls_client_features(body)
-            if hs_type == TLS_SERVER_HELLO:
-                return "server", tls_server_features(body)
+                results.append(("client", tls_client_features(body)))
+            elif hs_type == TLS_SERVER_HELLO:
+                results.append(("server", tls_server_features(body)))
+            elif hs_type == TLS_CERTIFICATE:
+                results.extend(("server", features) for features in parse_tls_certificate_features(body))
         except (struct.error, ValueError):
             if strict:
                 raise
-            return None
-    return None
+            return results
+    return results
 
 
 def tls_client_features(body: bytes) -> str:
@@ -957,7 +1183,7 @@ def extract(
     for segment in tcp_segments(read_pcap(path)):
         candidates = []
         try:
-            tls = parse_tls_handshake(segment.payload, strict=True)
+            tls_results = parse_tls_handshake(segment.payload, strict=True)
         except (struct.error, ValueError) as exc:
             if strict and not error_handler:
                 raise
@@ -965,13 +1191,14 @@ def extract(
                 error_handler(
                     f"skipping malformed TLS record in frame {segment.index}", exc
                 )
-            tls = None
+            tls_results = []
         tcpip = tcpip_features(segment)
         if tcpip:
             candidates.append(("tcpip", *tcpip))
 
-        if tls:
-            candidates.append(("tls", *tls))
+        for tls_role, tls_features in tls_results:
+            tls_protocol = "x509" if tls_features.startswith("x509|") else "tls"
+            candidates.append((tls_protocol, tls_role, tls_features))
 
         flow_key = (segment.src, segment.sport, segment.dst, segment.dport)
         banner = parse_ssh_banner(segment.payload)

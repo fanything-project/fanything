@@ -6,7 +6,7 @@
 <img width="200" height="239" alt="f" src="https://github.com/user-attachments/assets/e2e096fd-1ae5-4090-92b8-1e0a2fe85a4a" />
 
 
-`fanything` is an awesome, patent-unencumbered fingerprinting format for correlating SSH, TLS, QUIC, IKE, and TCP/IP stack behavior.
+`fanything` is an awesome, patent-unencumbered fingerprinting format for correlating SSH, TLS, X.509 certificate, QUIC, IKE, and TCP/IP stack behavior.
 
 The repository defines an algorithm named **FAN/1** (Flexible Anything
 Network fingerprint, version 1). FAN/1 is intentionally simple: each
@@ -24,7 +24,7 @@ fan1:<protocol>:<role>:<mode>:<base64url-normalized-features>:<digest-algorithm>
 ```
 
 * `fan1` identifies the algorithm version.
-* `<protocol>` is currently `tls`, `ssh`, `quic`, `ike`, or `tcpip`, but the
+* `<protocol>` is currently `tls`, `x509`, `ssh`, `quic`, `ike`, or `tcpip`, but the
   namespace can be extended to other services and transport behaviors.
 * `<role>` identifies handshake direction, for example `client`, `server`, or
   `peer`.
@@ -130,6 +130,38 @@ Normalization rules:
 * GREASE values are removed from TLS lists before canonicalization.
 * Missing fields are represented as empty strings.
 
+
+
+### X.509 certificate fingerprints
+
+Passive TLS captures can also expose server Certificate handshake messages.
+`fanfp.py` parses DER-encoded X.509 certificates from those messages and emits a
+separate `x509` protocol fingerprint for each certificate in the observed chain.
+The feature string is designed for similarity matching between certificates
+created by the same software, CA profile, appliance, or generation workflow, so
+it records certificate structure, OIDs, names, extension layout, and validity
+shape rather than depending only on a raw certificate hash.
+
+```text
+x509|server|idx=<chain_index>|ver=<x509_version>|serial_len=<serial_byte_length>|sig=<outer_signature_algorithm_oid>|tbs_sig=<tbs_signature_algorithm_oid>|issuer=<issuer_name_oid_values>|subject=<subject_name_oid_values>|valid_days=<validity_window_days>|spki_alg=<subject_public_key_algorithm_oid>|spki_param=<algorithm_parameter_oid_or_der>|pk_bits=<subject_public_key_bit_string_size>|san=<subject_alt_names>|ku=<key_usage_bits>|eku=<extended_key_usage_oids>|bc=<basic_constraints>|ski=<subject_key_identifier_shape>|aki=<authority_key_identifier_shape>|pol=<certificate_policy_oids>|aia=<authority_info_access_shape>|crldp=<crl_distribution_point_shape>|nc=<name_constraints_shape>|ext=<critical_flag_and_extension_oid_order>
+```
+
+Normalization rules:
+
+* Object identifiers are emitted in dotted decimal form and extension order is
+  preserved because OID choices and ordering can identify certificate generation
+  stacks.
+* Name attributes are emitted as `oid=value` pairs in DER order.
+* DNS, IP, email, URI, and OID Subject Alternative Names are decoded when
+  possible; complex GeneralName values are represented by short stable hashes.
+* Potentially large structured extensions such as AIA, CRL distribution points,
+  name constraints, SKI, and AKI are represented by short SHA-256-derived shape
+  tokens so the fingerprint remains compact.
+* `serial_len` and `valid_days` capture generation-profile behavior without
+  forcing every regenerated certificate to have a different similarity shape.
+
+See [documentation/X509.md](documentation/X509.md) for the complete field
+reference.
 
 ### TCP/IP stack fingerprints
 

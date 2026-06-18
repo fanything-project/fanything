@@ -39,6 +39,8 @@ Empty fields are represented as empty strings.
 ## Passive Extraction
 
 `fanfp.py` extracts TLS ClientHello and ServerHello records from TCP payloads.
+When Certificate handshake messages are present, it also emits separate `x509`
+fingerprints for DER-encoded certificates; see [X509.md](X509.md).
 It preserves observed list order after GREASE removal. Because `e=` keeps wire
 order, clients that vary extension order produce different full fingerprints.
 
