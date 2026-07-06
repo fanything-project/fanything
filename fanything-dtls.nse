@@ -27,7 +27,7 @@ fields used by fanfp.py for passive DTLS observations.
 -- |   protocol: dtls
 -- |   role: server
 -- |   fingerprint: fan1:dtls:server:active:...
--- |   features: dtls|server|v=65277|c=53|e=65281-35-15|sv=
+-- |   features: dtls|server|v=65277|c=53|e=65281-15|sv=
 -- |   sha256: ...
 -- |   flow:
 -- |     src: 192.0.2.10
@@ -49,6 +49,7 @@ local TLS_HANDSHAKE = 22
 local TLS_CLIENT_HELLO = 1
 local TLS_SERVER_HELLO = 2
 local DTLS_HELLO_VERIFY_REQUEST = 3
+local TLS_SERVER_HELLO_VOLATILE_EXTENSIONS = { [0] = true, [11] = true, [35] = true }
 
 local DTLS_VERSIONS = {
   ["DTLSv1.3"] = 0xfefc,
@@ -153,10 +154,18 @@ local function pack_u16_list(values)
   return table.concat(out)
 end
 
+local function is_grease(value)
+  return (value & 0x0f0f) == 0x0a0a and (value & 0x00ff) == ((value >> 8) & 0x00ff)
+end
+
+local function is_stable_server_hello_extension(value)
+  return not is_grease(value) and not TLS_SERVER_HELLO_VOLATILE_EXTENSIONS[value]
+end
+
 local function join_ints(values)
   local out = {}
   for _, value in ipairs(values) do
-    if not ((value & 0x0f0f) == 0x0a0a and (value & 0x00ff) == ((value >> 8) & 0x00ff)) then
+    if not is_grease(value) then
       out[#out + 1] = tostring(value)
     end
   end
@@ -240,7 +249,7 @@ local function parse_extensions(body, i)
         if not et or not el or eo + 3 + el > #ext_blob then break end
         local ed = ext_blob:sub(eo + 4, eo + 3 + el)
         eo = eo + 4 + el
-        ext_types[#ext_types + 1] = et
+        if is_stable_server_hello_extension(et) then ext_types[#ext_types + 1] = et end
         if et == 43 and #ed == 2 then selected_version = tostring(u16(ed, 1)) end
       end
     end

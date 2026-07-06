@@ -227,7 +227,7 @@ canonical feature string.
 
 ```text
 dtls|client|v=<dtls_version>|c=<cipher_suites>|e=<extensions>|g=<supported_groups>|p=<ec_point_formats>|sv=<supported_versions>|alpn=<alpn_protocols>|sig=<signature_algorithms>
-dtls|server|v=<dtls_version>|c=<selected_cipher>|e=<extensions>|sv=<selected_supported_version>
+dtls|server|v=<dtls_version>|c=<selected_cipher>|e=<stable_extensions>|sv=<selected_supported_version>
 ```
 
 Passive DTLS fingerprints come from observed UDP datagrams. Active DTLS
