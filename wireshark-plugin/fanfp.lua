@@ -195,9 +195,15 @@ end
 
 -- ─── GREASE / helpers ────────────────────────────────────────────────────────
 
+local TLS_SERVER_HELLO_VOLATILE_EXTENSIONS = { [0] = true, [11] = true, [35] = true }
+
 local function is_grease(v)
     return _band(v, 0x0F0F) == 0x0A0A
        and _band(v, 0x00FF) == _band(_rsh(v, 8), 0x00FF)
+end
+
+local function is_stable_server_hello_extension(v)
+    return not is_grease(v) and not TLS_SERVER_HELLO_VOLATILE_EXTENSIONS[v]
 end
 
 local function collect_ints(field_fn)
@@ -224,6 +230,16 @@ local function join_ints(values, grease_filter)
     local parts = {}
     for _, v in ipairs(values) do
         if not (grease_filter and is_grease(v)) then
+            parts[#parts+1] = tostring(v)
+        end
+    end
+    return table.concat(parts, "-")
+end
+
+local function join_server_hello_extensions(values)
+    local parts = {}
+    for _, v in ipairs(values) do
+        if is_stable_server_hello_extension(v) then
             parts[#parts+1] = tostring(v)
         end
     end
@@ -396,7 +412,7 @@ local function tls_fingerprints()
                 "tls|server|v=%d|c=%s|e=%s|sv=%s",
                 version,
                 tostring(ciphers[1] or ""),
-                join_ints(ext_types, true),
+                join_server_hello_extensions(ext_types),
                 tostring(sv_list[1] or ""))
             results[#results+1] = { role = "server", features = features }
         end
@@ -544,7 +560,7 @@ local function quic_fingerprints()
                     "quic|server|v=%d|tls_v=%d|c=%s|e=%s|sv=%s",
                     qver, tls_ver,
                     tostring(ciphers[1] or ""),
-                    join_ints(ext_types, true),
+                    join_server_hello_extensions(ext_types),
                     tostring(sv_list[1] or ""))
                 results[#results+1] = { role = "server", features = features }
             end
@@ -611,7 +627,7 @@ local function dtls_fingerprints()
                 "dtls|server|v=%d|c=%s|e=%s|sv=%s",
                 version,
                 tostring(ciphers[1] or ""),
-                join_ints(ext_types, true),
+                join_server_hello_extensions(ext_types),
                 tostring(sv_list[1] or ""))
             results[#results+1] = { role = "server", features = features }
         end

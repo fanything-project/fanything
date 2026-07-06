@@ -146,6 +146,12 @@ local function is_grease(v)
   return (v & 0x0f0f) == 0x0a0a and (v & 0x00ff) == ((v >> 8) & 0x00ff)
 end
 
+local TLS_SERVER_HELLO_VOLATILE_EXTENSIONS = { [0] = true, [11] = true, [35] = true }
+
+local function is_stable_server_hello_extension(v)
+  return not is_grease(v) and not TLS_SERVER_HELLO_VOLATILE_EXTENSIONS[v]
+end
+
 local function join_ints(values, filter_grease)
   local out = {}
   for _, v in ipairs(values) do
@@ -213,7 +219,7 @@ local function tls_server_features_from_raw(response)
             local el = u16(ext_blob, eo + 2)
             local ed = ext_blob:sub(eo + 4, eo + 3 + el)
             eo = eo + 4 + el
-            if not is_grease(et) then ext_types[#ext_types + 1] = et end
+            if is_stable_server_hello_extension(et) then ext_types[#ext_types + 1] = et end
             if et == 43 and #ed == 2 then selected_version = tostring(u16(ed, 1)) end
           end
         end

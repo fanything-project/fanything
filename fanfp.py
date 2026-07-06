@@ -26,6 +26,7 @@ TLS_HANDSHAKE = 22
 TLS_CLIENT_HELLO = 1
 TLS_SERVER_HELLO = 2
 TLS_CERTIFICATE = 11
+TLS_SERVER_HELLO_VOLATILE_EXTENSIONS = {0, 11, 35}
 SSH_MSG_KEXINIT = 20
 QUIC_INITIAL = 0
 IKEV2_SA = 33
@@ -1085,10 +1086,10 @@ def tls_server_features(body: bytes, protocol: str = "tls") -> str:
         while eo + 4 <= len(ext_blob):
             et, el = struct.unpack_from("!HH", ext_blob, eo); eo += 4
             ed = ext_blob[eo : eo + el]; eo += el
-            if not is_grease(et):
-                ext_types.append(et)
             if et == 43 and len(ed) == 2:
                 selected_version = str(struct.unpack("!H", ed)[0])
+            if not is_grease(et) and et not in TLS_SERVER_HELLO_VOLATILE_EXTENSIONS:
+                ext_types.append(et)
     return f"{protocol}|server|v={version}|c={cipher}|e={join_ints(ext_types)}|sv={selected_version}"
 
 
