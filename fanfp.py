@@ -37,6 +37,25 @@ QUIC_INITIAL_SALTS = {
     0xFF00001D: bytes.fromhex("afbfec289993d24c9e9786f19c6111e04390a899"),
 }
 MAX_TCP_STREAM_BYTES = 1024 * 1024
+IPV6_EXT_HOP_BY_HOP = 0
+IPV6_EXT_ROUTING = 43
+IPV6_EXT_FRAGMENT = 44
+IPV6_EXT_ESP = 50
+IPV6_EXT_AH = 51
+IPV6_EXT_DESTINATION = 60
+IPV6_EXT_MOBILITY = 135
+IPV6_EXT_EXPERIMENTAL_1 = 253
+IPV6_EXT_EXPERIMENTAL_2 = 254
+IPV6_EXT_HEADERS = {
+    IPV6_EXT_HOP_BY_HOP,
+    IPV6_EXT_ROUTING,
+    IPV6_EXT_FRAGMENT,
+    IPV6_EXT_AH,
+    IPV6_EXT_DESTINATION,
+    IPV6_EXT_MOBILITY,
+    IPV6_EXT_EXPERIMENTAL_1,
+    IPV6_EXT_EXPERIMENTAL_2,
+}
 
 
 def is_grease(value: int) -> bool:
@@ -313,22 +332,78 @@ def ipv4_udp(index: int, data: bytes) -> Iterator[UdpDatagram]:
 
 
 def ipv6_tcp(index: int, data: bytes) -> Iterator[TcpSegment]:
-    if len(data) < 60 or data[6] != 6:
+    parsed = ipv6_transport(data)
+    if parsed is None:
         return
-    plen = struct.unpack_from("!H", data, 4)[0]
+    next_header, payload, packet_len = parsed
+    if next_header != 6:
+        return
     src = str(ipaddress.IPv6Address(data[8:24]))
     dst = str(ipaddress.IPv6Address(data[24:40]))
     ttl = data[7]
-    yield from parse_tcp(index, src, dst, data[40 : 40 + plen], ttl, 6, plen + 40, False, 0)
+    yield from parse_tcp(index, src, dst, payload, ttl, 6, packet_len, False, 0)
 
 
 def ipv6_udp(index: int, data: bytes) -> Iterator[UdpDatagram]:
-    if len(data) < 48 or data[6] != 17:
+    parsed = ipv6_transport(data)
+    if parsed is None:
         return
-    plen = struct.unpack_from("!H", data, 4)[0]
+    next_header, payload, _ = parsed
+    if next_header != 17:
+        return
     src = str(ipaddress.IPv6Address(data[8:24]))
     dst = str(ipaddress.IPv6Address(data[24:40]))
-    yield from parse_udp(index, src, dst, data[40 : 40 + plen])
+    yield from parse_udp(index, src, dst, payload)
+
+
+def ipv6_transport(data: bytes) -> Optional[Tuple[int, bytes, int]]:
+    if len(data) < 40:
+        return None
+    payload_len = struct.unpack_from("!H", data, 4)[0]
+    packet_len = 40 + payload_len
+    if len(data) < packet_len:
+        return None
+
+    next_header = data[6]
+    offset = 40
+    end = packet_len
+    visited = 0
+
+    while next_header in IPV6_EXT_HEADERS:
+        visited += 1
+        if visited > 8 or offset >= end:
+            return None
+
+        if next_header == IPV6_EXT_FRAGMENT:
+            if offset + 8 > end:
+                return None
+            fragment_next = data[offset]
+            frag_word = struct.unpack_from("!H", data, offset + 2)[0]
+            fragment_offset = (frag_word >> 3) & 0x1FFF
+            more_fragments = bool(frag_word & 0x0001)
+            if fragment_offset != 0 or more_fragments:
+                return None
+            next_header = fragment_next
+            offset += 8
+            continue
+
+        if next_header == IPV6_EXT_AH:
+            if offset + 2 > end:
+                return None
+            header_len = (data[offset + 1] + 2) * 4
+        else:
+            if offset + 2 > end:
+                return None
+            header_len = (data[offset + 1] + 1) * 8
+
+        if header_len <= 0 or offset + header_len > end:
+            return None
+        next_header = data[offset]
+        offset += header_len
+
+    if next_header == IPV6_EXT_ESP:
+        return None
+    return next_header, data[offset:end], packet_len
 
 
 def parse_tcp(
