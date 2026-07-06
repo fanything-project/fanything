@@ -35,6 +35,20 @@ def tls_client_hello() -> bytes:
     return b"\x16\x03\x01" + len(handshake).to_bytes(2, "big") + handshake
 
 
+def tls_server_hello(extension_types: list[int]) -> bytes:
+    ext_blob = b"".join(struct.pack("!HH", et, 0) for et in extension_types)
+    body = (
+        struct.pack("!H", 0x0303)
+        + (b"\x00" * 32)
+        + b"\x00"
+        + struct.pack("!H", 0xC030)
+        + b"\x00"
+        + len(ext_blob).to_bytes(2, "big")
+        + ext_blob
+    )
+    handshake = b"\x02" + len(body).to_bytes(3, "big") + body
+    return b"\x16\x03\x03" + len(handshake).to_bytes(2, "big") + handshake
+
 def ipv4_tcp_syn() -> bytes:
     src = bytes([192, 0, 2, 10])
     dst = bytes([198, 51, 100, 20])
@@ -159,6 +173,13 @@ def test_tcp_segmentation() -> None:
     assert results[0][1].startswith("tls|client|v=771|c=4865|")
 
 
+def test_tls_server_hello_volatile_extensions() -> None:
+    initial = fanfp.parse_tls_handshake(tls_server_hello([0, 65281, 11, 35]))
+    resumed = fanfp.parse_tls_handshake(tls_server_hello([65281]))
+    assert initial == resumed
+    assert initial == [("server", "tls|server|v=771|c=49200|e=65281|sv=")]
+
+
 def main() -> int:
     test_malformed_tls()
     test_malformed_dtls()
@@ -168,6 +189,7 @@ def main() -> int:
     test_non_ethernet_linktypes()
     test_ipv6_extension_headers()
     test_tcp_segmentation()
+    test_tls_server_hello_volatile_extensions()
     return 0
 
 

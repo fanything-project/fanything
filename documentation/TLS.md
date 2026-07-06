@@ -5,7 +5,7 @@ server selections.
 
 ```text
 tls|client|v=<legacy_version>|c=<cipher_suites>|e=<extensions>|g=<supported_groups>|p=<ec_point_formats>|sv=<supported_versions>|alpn=<alpn_protocols>|sig=<signature_algorithms>
-tls|server|v=<legacy_version>|c=<selected_cipher>|e=<extensions>|sv=<selected_supported_version>
+tls|server|v=<legacy_version>|c=<selected_cipher>|e=<stable_extensions>|sv=<selected_supported_version>
 ```
 
 ## Client Fields
@@ -31,7 +31,7 @@ tls|server|v=<legacy_version>|c=<selected_cipher>|e=<extensions>|sv=<selected_su
 | `server` | fixed literal | ServerHello selection role. |
 | `v` | variable numeric text | Legacy TLS version field from ServerHello. TLS 1.3 commonly uses `771`. |
 | `c` | variable numeric text | Cipher suite selected by server. |
-| `e` | variable list | TLS extension types in ServerHello. Decimal values joined with `-`; wire order preserved; GREASE removed. |
+| `e` | variable list | Stable TLS extension types in ServerHello. Decimal values joined with `-`; wire order preserved; GREASE and volatile compatibility extensions are removed. |
 | `sv` | variable numeric text | Selected TLS version from extension `43`; empty when not present. |
 
 Empty fields are represented as empty strings.
@@ -41,8 +41,34 @@ Empty fields are represented as empty strings.
 `fanfp.py` extracts TLS ClientHello and ServerHello records from TCP payloads.
 When Certificate handshake messages are present, it also emits separate `x509`
 fingerprints for DER-encoded certificates; see [X509.md](X509.md).
-It preserves observed list order after GREASE removal. Because `e=` keeps wire
-order, clients that vary extension order produce different full fingerprints.
+It preserves observed list order after GREASE removal. Because client `e=` keeps
+wire order, clients that vary extension order produce different full
+fingerprints.
+
+## Proposal for ServerHello Stability
+
+Issue [#6](https://github.com/fanything-project/fanything/issues/6) shows a
+server that emits two passive TLS server fingerprints for the same selected
+version and cipher because initial and resumed handshakes carry different
+ServerHello compatibility extensions. Initial handshakes can include
+`server_name` (`0`), `ec_point_formats` (`11`), and `session_ticket` (`35`),
+while resumed or follow-up handshakes can omit them and leave only
+`renegotiation_info` (`65281`).
+
+The proposed FAN/1 normalization is:
+
+* Keep ServerHello `v`, `c`, and selected supported version (`sv`) unchanged.
+* Keep stable ServerHello extension types in wire order.
+* Continue removing GREASE extension types.
+* Remove volatile compatibility extensions `0`, `11`, and `35` from the TLS and
+  DTLS server `e=` list before hashing.
+
+This intentionally trades a small amount of exact handshake-context detail for a
+more stable passive server implementation fingerprint. If analysts need to
+study ticket issuance, SNI acknowledgement, or legacy EC point-format behavior,
+they should inspect the raw handshake or extend tooling with a separate
+handshake-context record rather than mixing those variables into the default
+server fingerprint.
 
 ## GREASE
 
