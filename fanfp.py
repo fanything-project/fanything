@@ -283,8 +283,9 @@ def read_pcapng(data: bytes) -> Iterator[Packet]:
             yield Packet(index, payload, linktype)
         elif block_type == 3 and len(body) >= 4:
             linktype = interfaces[0] if interfaces else DLT_EN10MB
-            cap_len = struct.unpack_from(endian + "I", body, 0)[0]
-            payload = body[4 : 4 + cap_len]
+            original_len = struct.unpack_from(endian + "I", body, 0)[0]
+            payload_len = min(original_len, len(body) - 4)
+            payload = body[4 : 4 + payload_len]
             index += 1
             yield Packet(index, payload, linktype)
         offset += block_len

@@ -65,6 +65,13 @@ def write_pcapng(path: Path, linktype: int, frame: bytes) -> None:
     path.write_bytes(shb + idb + epb)
 
 
+def write_pcapng_spb(path: Path, linktype: int, frame: bytes) -> None:
+    shb = pcapng_block(0x0A0D0D0A, struct.pack("<IHHq", 0x1A2B3C4D, 1, 0, -1))
+    idb = pcapng_block(1, struct.pack("<HHI", linktype, 0, 65535))
+    spb = pcapng_block(3, struct.pack("<I", len(frame)) + frame)
+    path.write_bytes(shb + idb + spb)
+
+
 def assert_tcpip_detected(linktype: int, frame: bytes) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         path = Path(tmpdir) / "capture.pcap"
@@ -92,12 +99,26 @@ def assert_pcapng_tcpip_detected(linktype: int, frame: bytes) -> None:
     assert len(tcpip_records) == 1, records
 
 
+def assert_pcapng_spb_tcpip_detected(linktype: int, frame: bytes) -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "capture-spb.pcapng"
+        write_pcapng_spb(path, linktype, frame)
+        records = list(fanfp.extract(path))
+    tcpip_records = [
+        record
+        for record in records
+        if record["protocol"] == "tcpip" and record["role"] == "client"
+    ]
+    assert len(tcpip_records) == 1, records
+
+
 def main() -> int:
     packet = ipv4_tcp_syn()
     assert_tcpip_detected(fanfp.DLT_RAW, packet)
     assert_tcpip_detected(fanfp.DLT_LINUX_SLL, linux_sll_frame(packet))
     assert_tcpip_detected(fanfp.DLT_NULL, loopback_frame(packet))
     assert_pcapng_tcpip_detected(fanfp.DLT_RAW, packet)
+    assert_pcapng_spb_tcpip_detected(fanfp.DLT_RAW, packet)
     return 0
 
 
