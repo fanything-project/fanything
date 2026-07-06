@@ -11,7 +11,7 @@ import ipaddress
 import json
 import struct
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, List, NamedTuple, Optional, Tuple, Union
 
@@ -36,6 +36,7 @@ QUIC_INITIAL_SALTS = {
     0x00000001: bytes.fromhex("38762cf7f55934b34d179ae6a4c80cadccbb7f0a"),
     0xFF00001D: bytes.fromhex("afbfec289993d24c9e9786f19c6111e04390a899"),
 }
+MAX_TCP_STREAM_BYTES = 1024 * 1024
 
 
 def is_grease(value: int) -> bool:
@@ -112,6 +113,7 @@ class TcpSegment:
     dst: str
     sport: int
     dport: int
+    seq: int
     payload: bytes
     flags: int = 0
     window: int = 0
@@ -125,6 +127,55 @@ class TcpSegment:
     @property
     def flow(self) -> Dict[str, object]:
         return {"src": self.src, "sport": self.sport, "dst": self.dst, "dport": self.dport}
+
+
+@dataclass
+class TcpStreamBuffer:
+    chunks: Dict[int, bytes] = field(default_factory=dict)
+    max_bytes: int = MAX_TCP_STREAM_BYTES
+
+    def add(self, segment: TcpSegment) -> bytes:
+        if not segment.payload:
+            return self.data()
+
+        existing = self.chunks.get(segment.seq)
+        if existing is None or len(segment.payload) > len(existing):
+            self.chunks[segment.seq] = segment.payload
+        self._trim()
+        return self.data()
+
+    def _trim(self) -> None:
+        total = sum(len(chunk) for chunk in self.chunks.values())
+        while total > self.max_bytes and self.chunks:
+            first_seq = min(self.chunks)
+            chunk = self.chunks.pop(first_seq)
+            excess = total - self.max_bytes
+            if excess < len(chunk):
+                self.chunks[first_seq + excess] = chunk[excess:]
+                total = self.max_bytes
+            else:
+                total -= len(chunk)
+
+    def data(self) -> bytes:
+        if not self.chunks:
+            return b""
+        out = bytearray()
+        end: Optional[int] = None
+        for seq in sorted(self.chunks):
+            chunk = self.chunks[seq]
+            if end is None:
+                out.extend(chunk)
+                end = seq + len(chunk)
+                continue
+            if seq > end:
+                break
+            skip = end - seq
+            if skip < len(chunk):
+                out.extend(chunk[skip:])
+                end = seq + len(chunk)
+            if len(out) >= self.max_bytes:
+                return bytes(out[: self.max_bytes])
+        return bytes(out)
 
 
 @dataclass(frozen=True)
@@ -297,12 +348,13 @@ def parse_tcp(
     off = ((data[12] >> 4) & 0x0F) * 4
     if off < 20 or len(data) < off:
         return
+    seq = struct.unpack_from("!I", data, 4)[0]
     flags = data[13]
     window = struct.unpack_from("!H", data, 14)[0]
     tcp_options = data[20:off]
     payload = data[off:]
     yield TcpSegment(
-        index, src, dst, sport, dport, payload, flags, window, ttl,
+        index, src, dst, sport, dport, seq, payload, flags, window, ttl,
         ip_version, ip_len, ip_df, ip_id, tcp_options
     )
 
@@ -679,6 +731,13 @@ def parse_tls_handshake(payload: bytes, strict: bool = False) -> List[Tuple[str,
     return results
 
 
+def has_complete_tls_record(payload: bytes) -> bool:
+    if len(payload) < 5 or payload[0] != TLS_HANDSHAKE:
+        return False
+    rec_len = struct.unpack_from("!H", payload, 3)[0]
+    return len(payload) >= 5 + rec_len
+
+
 def parse_dtls_handshake(payload: bytes, strict: bool = False) -> Optional[Tuple[str, str]]:
     offset = 0
     while offset + 13 <= len(payload):
@@ -723,6 +782,13 @@ def parse_dtls_handshake(payload: bytes, strict: bool = False) -> Optional[Tuple
                     raise
                 return None
     return None
+
+
+def has_complete_rdp_tpkt(payload: bytes) -> bool:
+    if len(payload) < 4 or payload[0] != 3 or payload[1] != 0:
+        return False
+    tpkt_len = struct.unpack_from("!H", payload, 2)[0]
+    return tpkt_len < 7 or len(payload) >= tpkt_len
 
 
 def parse_rdp_x224(payload: bytes, strict: bool = False) -> List[Tuple[str, str]]:
@@ -1284,62 +1350,78 @@ def extract(
     strict: bool = False,
 ) -> Iterator[Dict[str, object]]:
     seen = set()
+    streams: Dict[Tuple[str, int, str, int], TcpStreamBuffer] = {}
     ssh_banners: Dict[Tuple[str, int, str, int], Tuple[str, TcpSegment]] = {}
     ssh_completed = set()
     for segment in tcp_segments(read_pcap(path)):
         candidates = []
-        try:
-            tls_results = parse_tls_handshake(segment.payload, strict=True)
-        except (struct.error, ValueError) as exc:
-            if strict and not error_handler:
-                raise
-            if error_handler:
-                error_handler(
-                    f"skipping malformed TLS record in frame {segment.index}", exc
-                )
-            tls_results = []
+        flow_key = (segment.src, segment.sport, segment.dst, segment.dport)
         tcpip = tcpip_features(segment)
         if tcpip:
             candidates.append(("tcpip", *tcpip))
 
-        for tls_role, tls_features in tls_results:
-            tls_protocol = "x509" if tls_features.startswith("x509|") else "tls"
-            candidates.append((tls_protocol, tls_role, tls_features))
+        stream_payload = b""
+        if segment.payload:
+            stream_payload = streams.setdefault(flow_key, TcpStreamBuffer()).add(segment)
 
-        try:
-            rdp_results = parse_rdp_x224(segment.payload, strict=strict)
-        except (struct.error, ValueError) as exc:
-            if strict and not error_handler:
-                raise
-            if error_handler:
-                error_handler(
-                    f"skipping malformed RDP X.224 packet in frame {segment.index}", exc
+        if stream_payload:
+            try:
+                tls_results = parse_tls_handshake(
+                    stream_payload,
+                    strict=strict and has_complete_tls_record(stream_payload),
                 )
-            rdp_results = []
-        for rdp_role, rdp_features in rdp_results:
-            candidates.append(("rdp", rdp_role, rdp_features))
+            except (struct.error, ValueError) as exc:
+                if strict and not error_handler:
+                    raise
+                if error_handler:
+                    error_handler(
+                        f"skipping malformed TLS stream ending at frame {segment.index}", exc
+                    )
+                tls_results = []
 
-        flow_key = (segment.src, segment.sport, segment.dst, segment.dport)
-        banner = parse_ssh_banner(segment.payload)
-        if banner:
-            software, rest = banner
-            ssh_banners[flow_key] = (software, segment)
-            ssh = parse_ssh_kexinit(rest, software)
-            if ssh:
-                ssh_completed.add(flow_key)
-                candidates.append(("ssh", *ssh))
-        elif flow_key in ssh_banners and flow_key not in ssh_completed:
-            software, _ = ssh_banners[flow_key]
-            ssh = parse_ssh_kexinit(segment.payload, software)
-            if ssh:
-                ssh_completed.add(flow_key)
-                candidates.append(("ssh", *ssh))
+            for tls_role, tls_features in tls_results:
+                tls_protocol = "x509" if tls_features.startswith("x509|") else "tls"
+                candidates.append((tls_protocol, tls_role, tls_features))
+
+            try:
+                rdp_results = parse_rdp_x224(
+                    stream_payload,
+                    strict=strict and has_complete_rdp_tpkt(stream_payload),
+                )
+            except (struct.error, ValueError) as exc:
+                if strict and not error_handler:
+                    raise
+                if error_handler:
+                    error_handler(
+                        f"skipping malformed RDP X.224 stream ending at frame {segment.index}", exc
+                    )
+                rdp_results = []
+            for rdp_role, rdp_features in rdp_results:
+                candidates.append(("rdp", rdp_role, rdp_features))
+
+            banner = parse_ssh_banner(stream_payload)
+            if banner:
+                software, rest = banner
+                ssh_banners.setdefault(flow_key, (software, segment))
+                ssh = parse_ssh_kexinit(rest, software)
+                if ssh:
+                    ssh_completed.add(flow_key)
+                    candidates.append(("ssh", *ssh))
+            elif flow_key in ssh_banners and flow_key not in ssh_completed:
+                software, _ = ssh_banners[flow_key]
+                ssh = parse_ssh_kexinit(stream_payload, software)
+                if ssh:
+                    ssh_completed.add(flow_key)
+                    candidates.append(("ssh", *ssh))
 
         for protocol, role, features in candidates:
             key = (protocol, role, features, tuple(segment.flow.items()))
             if key not in seen:
                 seen.add(key)
                 yield emit(protocol, role, features, segment)
+
+        if segment.flags & 0x05:
+            streams.pop(flow_key, None)
 
     for flow_key, (software, segment) in ssh_banners.items():
         if flow_key not in ssh_completed:
