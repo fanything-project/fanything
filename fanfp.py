@@ -56,6 +56,16 @@ IPV6_EXT_HEADERS = {
     IPV6_EXT_EXPERIMENTAL_1,
     IPV6_EXT_EXPERIMENTAL_2,
 }
+DLT_NULL = 0
+DLT_EN10MB = 1
+DLT_RAW = 101
+DLT_LOOP = 108
+DLT_LINUX_SLL = 113
+DLT_IEEE802_11_RADIOTAP = 127
+DLT_LINUX_SLL2 = 276
+ETH_TYPE_IPV4 = 0x0800
+ETH_TYPE_IPV6 = 0x86DD
+LLC_SNAP = b"\xaa\xaa\x03\x00\x00\x00"
 
 
 def is_grease(value: int) -> bool:
@@ -123,6 +133,7 @@ def fan_fingerprint(
 class Packet:
     index: int
     payload: bytes
+    linktype: int = DLT_EN10MB
 
 
 @dataclass(frozen=True)
@@ -236,6 +247,7 @@ def read_pcap(path: Path) -> Iterator[Packet]:
     endian = {b"\xd4\xc3\xb2\xa1": "<", b"\xa1\xb2\xc3\xd4": ">", b"\x4d\x3c\xb2\xa1": "<", b"\xa1\xb2\x3c\x4d": ">"}.get(magic)
     if endian is None:
         raise ValueError("unsupported capture format")
+    linktype = struct.unpack_from(endian + "I", data, 20)[0]
     offset = 24
     index = 0
     while offset + 16 <= len(data):
@@ -244,13 +256,14 @@ def read_pcap(path: Path) -> Iterator[Packet]:
         payload = data[offset : offset + incl_len]
         offset += incl_len
         index += 1
-        yield Packet(index, payload)
+        yield Packet(index, payload, linktype)
 
 
 def read_pcapng(data: bytes) -> Iterator[Packet]:
     offset = 0
     endian = "<"
     index = 0
+    interfaces: List[int] = []
     while offset + 12 <= len(data):
         block_type, block_len = struct.unpack_from(endian + "II", data, offset)
         if block_len < 12 or offset + block_len > len(data):
@@ -258,49 +271,147 @@ def read_pcapng(data: bytes) -> Iterator[Packet]:
         body = data[offset + 8 : offset + block_len - 4]
         if block_type == 0x0A0D0D0A and len(body) >= 4:
             endian = "<" if body[:4] == b"\x4d\x3c\x2b\x1a" else ">"
+            interfaces = []
+        elif block_type == 1 and len(body) >= 8:
+            interfaces.append(struct.unpack_from(endian + "H", body, 0)[0])
         elif block_type == 6 and len(body) >= 20:
+            interface_id = struct.unpack_from(endian + "I", body, 0)[0]
+            linktype = interfaces[interface_id] if interface_id < len(interfaces) else DLT_EN10MB
             cap_len = struct.unpack_from(endian + "I", body, 12)[0]
             payload = body[20 : 20 + cap_len]
             index += 1
-            yield Packet(index, payload)
-        elif block_type == 3 and len(body) >= 16:
-            cap_len = struct.unpack_from(endian + "I", body, 8)[0]
-            payload = body[16 : 16 + cap_len]
+            yield Packet(index, payload, linktype)
+        elif block_type == 3 and len(body) >= 4:
+            linktype = interfaces[0] if interfaces else DLT_EN10MB
+            cap_len = struct.unpack_from(endian + "I", body, 0)[0]
+            payload = body[4 : 4 + cap_len]
             index += 1
-            yield Packet(index, payload)
+            yield Packet(index, payload, linktype)
         offset += block_len
+
+
+def ethernet_payloads(frame: bytes) -> Iterator[Tuple[int, bytes]]:
+    if len(frame) < 14:
+        return
+    eth_type = struct.unpack_from("!H", frame, 12)[0]
+    offset = 14
+    while eth_type in (0x8100, 0x88A8, 0x9100) and offset + 4 <= len(frame):
+        eth_type = struct.unpack_from("!H", frame, offset + 2)[0]
+        offset += 4
+    yield eth_type, frame[offset:]
+
+
+def raw_ip_payload(frame: bytes) -> Iterator[Tuple[int, bytes]]:
+    if not frame:
+        return
+    version = frame[0] >> 4
+    if version == 4:
+        yield ETH_TYPE_IPV4, frame
+    elif version == 6:
+        yield ETH_TYPE_IPV6, frame
+
+
+def loopback_payload(frame: bytes, network_order: bool = False) -> Iterator[Tuple[int, bytes]]:
+    if len(frame) < 4:
+        return
+    payload = frame[4:]
+    version = payload[0] >> 4 if payload else 0
+    if version == 4:
+        yield ETH_TYPE_IPV4, payload
+        return
+    if version == 6:
+        yield ETH_TYPE_IPV6, payload
+        return
+
+    endian_values = [struct.unpack_from(">I" if network_order else "<I", frame, 0)[0]]
+    if not network_order:
+        endian_values.append(struct.unpack_from(">I", frame, 0)[0])
+    family = next((value for value in endian_values if value in (2, 10, 24, 28, 30)), None)
+    if family == 2:
+        yield ETH_TYPE_IPV4, payload
+    elif family in (10, 24, 28, 30):
+        yield ETH_TYPE_IPV6, payload
+
+
+def linux_sll_payload(frame: bytes) -> Iterator[Tuple[int, bytes]]:
+    if len(frame) < 16:
+        return
+    protocol = struct.unpack_from("!H", frame, 14)[0]
+    yield protocol, frame[16:]
+
+
+def linux_sll2_payload(frame: bytes) -> Iterator[Tuple[int, bytes]]:
+    if len(frame) < 20:
+        return
+    protocol = struct.unpack_from("!H", frame, 0)[0]
+    yield protocol, frame[20:]
+
+
+def radiotap_payload(frame: bytes) -> Iterator[Tuple[int, bytes]]:
+    if len(frame) < 4:
+        return
+    radiotap_len = struct.unpack_from("<H", frame, 2)[0]
+    if radiotap_len + 24 > len(frame):
+        return
+    offset = radiotap_len
+    frame_control = struct.unpack_from("<H", frame, offset)[0]
+    frame_type = (frame_control >> 2) & 0x03
+    subtype = (frame_control >> 4) & 0x0F
+    to_ds = bool(frame_control & 0x0100)
+    from_ds = bool(frame_control & 0x0200)
+    protected = bool(frame_control & 0x4000)
+    if frame_type != 2 or protected:
+        return
+
+    header_len = 24
+    if to_ds and from_ds:
+        header_len += 6
+    if subtype & 0x08:
+        header_len += 2
+    llc_offset = offset + header_len
+    if llc_offset + 8 > len(frame):
+        return
+    llc = frame[llc_offset:]
+    if not llc.startswith(LLC_SNAP):
+        return
+    eth_type = struct.unpack_from("!H", llc, 6)[0]
+    yield eth_type, llc[8:]
+
+
+def ip_payloads(packet: Packet) -> Iterator[Tuple[int, bytes]]:
+    frame = packet.payload
+    if packet.linktype == DLT_EN10MB:
+        yield from ethernet_payloads(frame)
+    elif packet.linktype == DLT_RAW:
+        yield from raw_ip_payload(frame)
+    elif packet.linktype == DLT_NULL:
+        yield from loopback_payload(frame)
+    elif packet.linktype == DLT_LOOP:
+        yield from loopback_payload(frame, network_order=True)
+    elif packet.linktype == DLT_LINUX_SLL:
+        yield from linux_sll_payload(frame)
+    elif packet.linktype == DLT_LINUX_SLL2:
+        yield from linux_sll2_payload(frame)
+    elif packet.linktype == DLT_IEEE802_11_RADIOTAP:
+        yield from radiotap_payload(frame)
 
 
 def tcp_segments(packets: Iterable[Packet]) -> Iterator[TcpSegment]:
     for packet in packets:
-        frame = packet.payload
-        if len(frame) < 14:
-            continue
-        eth_type = struct.unpack_from("!H", frame, 12)[0]
-        offset = 14
-        if eth_type == 0x8100 and len(frame) >= 18:
-            eth_type = struct.unpack_from("!H", frame, 16)[0]
-            offset = 18
-        if eth_type == 0x0800:
-            yield from ipv4_tcp(packet.index, frame[offset:])
-        elif eth_type == 0x86DD:
-            yield from ipv6_tcp(packet.index, frame[offset:])
+        for eth_type, payload in ip_payloads(packet):
+            if eth_type == ETH_TYPE_IPV4:
+                yield from ipv4_tcp(packet.index, payload)
+            elif eth_type == ETH_TYPE_IPV6:
+                yield from ipv6_tcp(packet.index, payload)
 
 
 def udp_datagrams(packets: Iterable[Packet]) -> Iterator[UdpDatagram]:
     for packet in packets:
-        frame = packet.payload
-        if len(frame) < 14:
-            continue
-        eth_type = struct.unpack_from("!H", frame, 12)[0]
-        offset = 14
-        if eth_type == 0x8100 and len(frame) >= 18:
-            eth_type = struct.unpack_from("!H", frame, 16)[0]
-            offset = 18
-        if eth_type == 0x0800:
-            yield from ipv4_udp(packet.index, frame[offset:])
-        elif eth_type == 0x86DD:
-            yield from ipv6_udp(packet.index, frame[offset:])
+        for eth_type, payload in ip_payloads(packet):
+            if eth_type == ETH_TYPE_IPV4:
+                yield from ipv4_udp(packet.index, payload)
+            elif eth_type == ETH_TYPE_IPV6:
+                yield from ipv6_udp(packet.index, payload)
 
 
 def ipv4_tcp(index: int, data: bytes) -> Iterator[TcpSegment]:

@@ -14,3 +14,4 @@ test:
 	@$(PYTHON3) test/check-protos.py $(FANFP) $(TEST_PCAP) $(TEST_EXP)
 	@$(PYTHON3) test/tcp-reassembly.py
 	@$(PYTHON3) test/ipv6-extension-headers.py
+	@$(PYTHON3) test/capture-linktypes.py
