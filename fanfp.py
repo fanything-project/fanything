@@ -22,6 +22,8 @@ except Exception:  # pragma: no cover - optional QUIC Initial decryption support
     AESGCM = None
     Cipher = algorithms = modes = None
 
+from pycapng import PcapNG as _PcapNG
+
 TLS_HANDSHAKE = 22
 TLS_CLIENT_HELLO = 1
 TLS_SERVER_HELLO = 2
@@ -239,56 +241,26 @@ class QuicLongPacket:
 
 def read_pcap(path: Path) -> Iterator[Packet]:
     data = path.read_bytes()
-    if data[:4] == b"\x0a\x0d\x0d\x0a":
-        yield from read_pcapng(data)
-        return
-
-    magic = data[:4]
-    endian = {b"\xd4\xc3\xb2\xa1": "<", b"\xa1\xb2\xc3\xd4": ">", b"\x4d\x3c\xb2\xa1": "<", b"\xa1\xb2\x3c\x4d": ">"}.get(magic)
-    if endian is None:
-        raise ValueError("unsupported capture format")
-    linktype = struct.unpack_from(endian + "I", data, 20)[0]
-    offset = 24
-    index = 0
-    while offset + 16 <= len(data):
-        _, _, incl_len, _ = struct.unpack_from(endian + "IIII", data, offset)
-        offset += 16
-        payload = data[offset : offset + incl_len]
-        offset += incl_len
-        index += 1
-        yield Packet(index, payload, linktype)
-
-
-def read_pcapng(data: bytes) -> Iterator[Packet]:
-    offset = 0
-    endian = "<"
-    index = 0
+    packets: List[Packet] = []
     interfaces: List[int] = []
-    while offset + 12 <= len(data):
-        block_type, block_len = struct.unpack_from(endian + "II", data, offset)
-        if block_len < 12 or offset + block_len > len(data):
-            break
-        body = data[offset + 8 : offset + block_len - 4]
-        if block_type == 0x0A0D0D0A and len(body) >= 4:
-            endian = "<" if body[:4] == b"\x4d\x3c\x2b\x1a" else ">"
-            interfaces = []
-        elif block_type == 1 and len(body) >= 8:
-            interfaces.append(struct.unpack_from(endian + "H", body, 0)[0])
-        elif block_type == 6 and len(body) >= 20:
-            interface_id = struct.unpack_from(endian + "I", body, 0)[0]
-            linktype = interfaces[interface_id] if interface_id < len(interfaces) else DLT_EN10MB
-            cap_len = struct.unpack_from(endian + "I", body, 12)[0]
-            payload = body[20 : 20 + cap_len]
-            index += 1
-            yield Packet(index, payload, linktype)
-        elif block_type == 3 and len(body) >= 4:
+    index = [0]
+
+    def _cb(idx: int, block_type: int, block_len: int, block_data: bytes) -> None:
+        if block_type == 1 and len(block_data) >= 2:  # IDB
+            interfaces.append(struct.unpack_from("<H", block_data, 0)[0])
+        elif block_type == 6 and len(block_data) >= 20:  # EPB
+            iface_id, _tsh, _tsl, cap_len, _orig = struct.unpack_from("<IIIII", block_data, 0)
+            linktype = interfaces[iface_id] if iface_id < len(interfaces) else DLT_EN10MB
+            index[0] += 1
+            packets.append(Packet(index[0], block_data[20 : 20 + cap_len], linktype))
+        elif block_type == 3 and len(block_data) >= 4:  # SPB
             linktype = interfaces[0] if interfaces else DLT_EN10MB
-            original_len = struct.unpack_from(endian + "I", body, 0)[0]
-            payload_len = min(original_len, len(body) - 4)
-            payload = body[4 : 4 + payload_len]
-            index += 1
-            yield Packet(index, payload, linktype)
-        offset += block_len
+            orig_len = struct.unpack_from("<I", block_data, 0)[0]
+            index[0] += 1
+            packets.append(Packet(index[0], block_data[4 : 4 + min(orig_len, len(block_data) - 4)], linktype))
+
+    _PcapNG().ForeachMem(data, _cb)
+    yield from packets
 
 
 def ethernet_payloads(frame: bytes) -> Iterator[Tuple[int, bytes]]:
