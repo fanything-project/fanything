@@ -22,7 +22,7 @@ except Exception:  # pragma: no cover - optional QUIC Initial decryption support
     AESGCM = None
     Cipher = algorithms = modes = None
 
-from pycapng import PcapNG as _PcapNG
+import pycapng
 
 TLS_HANDSHAKE = 22
 TLS_CLIENT_HELLO = 1
@@ -240,27 +240,8 @@ class QuicLongPacket:
 
 
 def read_pcap(path: Path) -> Iterator[Packet]:
-    data = path.read_bytes()
-    packets: List[Packet] = []
-    interfaces: List[int] = []
-    index = [0]
-
-    def _cb(idx: int, block_type: int, block_len: int, block_data: bytes) -> None:
-        if block_type == 1 and len(block_data) >= 2:  # IDB
-            interfaces.append(struct.unpack_from("<H", block_data, 0)[0])
-        elif block_type == 6 and len(block_data) >= 20:  # EPB
-            iface_id, _tsh, _tsl, cap_len, _orig = struct.unpack_from("<IIIII", block_data, 0)
-            linktype = interfaces[iface_id] if iface_id < len(interfaces) else DLT_EN10MB
-            index[0] += 1
-            packets.append(Packet(index[0], block_data[20 : 20 + cap_len], linktype))
-        elif block_type == 3 and len(block_data) >= 4:  # SPB
-            linktype = interfaces[0] if interfaces else DLT_EN10MB
-            orig_len = struct.unpack_from("<I", block_data, 0)[0]
-            index[0] += 1
-            packets.append(Packet(index[0], block_data[4 : 4 + min(orig_len, len(block_data) - 4)], linktype))
-
-    _PcapNG().ForeachMem(data, _cb)
-    yield from packets
+    for pkt in pycapng.read_packets(str(path)):
+        yield Packet(pkt.index, pkt.data, pkt.linktype)
 
 
 def ethernet_payloads(frame: bytes) -> Iterator[Tuple[int, bytes]]:
